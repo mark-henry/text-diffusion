@@ -1,0 +1,37 @@
+[
+  {
+    "min_len": 10,
+    "max_len": 50,
+    "num_blocks": 4674,
+    "exact_match_rate": 0.9,
+    "avg_word_match": 1.0
+  },
+  {
+    "min_len": 51,
+    "max_len": 100,
+    "num_blocks": 2090,
+    "exact_match_rate": 0.3,
+    "avg_word_match": 0.9970588235294118
+  },
+  {
+    "min_len": 101,
+    "max_len": 200,
+    "num_blocks": 1170,
+    "exact_match_rate": 0.2,
+    "avg_word_match": 0.9872250465484449
+  },
+  {
+    "min_len": 201,
+    "max_len": 300,
+    "num_blocks": 659,
+    "exact_match_rate": 0.0,
+    "avg_word_match": 0.986613018424501
+  },
+  {
+    "min_len": 301,
+    "max_len": 512,
+    "num_blocks": 536,
+    "exact_match_rate": 0.0,
+    "avg_word_match": 0.9262023026227455
+  }
+]
