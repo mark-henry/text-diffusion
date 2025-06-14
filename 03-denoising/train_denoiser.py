@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader, random_split
 from transformers import BartForConditionalGeneration, BartTokenizer
+from diffusers import UNet1DModel
 import numpy as np
 from tqdm import tqdm
 from datasets import load_dataset
@@ -16,7 +17,6 @@ class CosineNoiseScheduler:
         self.beta_start = beta_start
         self.beta_end = beta_end
         
-        # Create cosine schedule (better than linear)
         self.betas = self._cosine_beta_schedule(num_timesteps, beta_start, beta_end)
         self.alphas = 1 - self.betas
         self.alphas_cumprod = torch.cumprod(self.alphas, dim=0)
@@ -99,57 +99,182 @@ class LatentDataset(Dataset):
             latents = (latents - self.latent_mean.squeeze()) / self.latent_std.squeeze()
         return latents
 
-class SimpleUNet1D(nn.Module):
-    """Simplified UNet that actually works."""
-    def __init__(self, in_channels=768, out_channels=768, hidden_dim=256):
+class TextUNet1D(nn.Module):
+    """
+    UNet specifically designed for BART semantic latent representations.
+    
+    Input: [batch_size, 768, 128] where:
+    - 768 channels = BART-base semantic embedding dimensions (not frequency bands)
+    - 128 sequence length = token positions (not time steps)
+    - Values are normalized semantic embeddings (not raw audio/signals)
+    
+    Design Principles:
+    - Gentle downsampling to preserve text structure
+    - Skip connections to maintain semantic information across scales
+    - No attention mechanisms (simpler is better for semantic embeddings)
+    - Moderate parameter count (~5-10M) to avoid overfitting
+    - Time embedding integrated throughout the network
+    """
+    def __init__(self, in_channels=768, out_channels=768, time_embed_dim=256):
         super().__init__()
-        self.in_channels = in_channels
-        self.out_channels = out_channels
         
-        # Time embedding
+        # Time embedding for diffusion timesteps
+        # Maps timestep t to a rich representation that guides denoising
         self.time_embed = nn.Sequential(
-            nn.Linear(1, hidden_dim),
+            nn.Linear(1, time_embed_dim),
             nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-        )
-        
-        # Simple encoder-decoder without skip connections for now
-        self.encoder = nn.Sequential(
-            nn.Conv1d(in_channels, hidden_dim, 3, padding=1),
-            nn.GroupNorm(8, hidden_dim),
-            nn.SiLU(),
-            nn.Conv1d(hidden_dim, hidden_dim, 3, padding=1),
-            nn.GroupNorm(8, hidden_dim),
+            nn.Linear(time_embed_dim, time_embed_dim),
             nn.SiLU(),
         )
         
-        self.middle = nn.Sequential(
-            nn.Conv1d(hidden_dim, hidden_dim * 2, 3, padding=1),
-            nn.GroupNorm(8, hidden_dim * 2),
+        # Encoder (downsampling path)
+        # We use gentle downsampling since 128 tokens isn't that long
+        # Each block reduces sequence length by 2x while increasing channels
+        
+        # Block 1: 768 -> 256 channels, 128 -> 64 sequence length
+        self.down1 = nn.Sequential(
+            nn.Conv1d(in_channels, 256, kernel_size=3, padding=1),
+            nn.GroupNorm(8, 256),  # GroupNorm works well with varying batch sizes
             nn.SiLU(),
-            nn.Conv1d(hidden_dim * 2, hidden_dim, 3, padding=1),
-            nn.GroupNorm(8, hidden_dim),
+            nn.Conv1d(256, 256, kernel_size=3, padding=1),
+            nn.GroupNorm(8, 256),
+            nn.SiLU(),
+        )
+        self.down1_pool = nn.Conv1d(256, 256, kernel_size=3, stride=2, padding=1)
+        
+        # Time projection for down1
+        self.time_proj1 = nn.Linear(time_embed_dim, 256)
+        
+        # Block 2: 256 -> 384 channels, 64 -> 32 sequence length
+        self.down2 = nn.Sequential(
+            nn.Conv1d(256, 384, kernel_size=3, padding=1),
+            nn.GroupNorm(8, 384),
+            nn.SiLU(),
+            nn.Conv1d(384, 384, kernel_size=3, padding=1),
+            nn.GroupNorm(8, 384),
+            nn.SiLU(),
+        )
+        self.down2_pool = nn.Conv1d(384, 384, kernel_size=3, stride=2, padding=1)
+        
+        # Time projection for down2
+        self.time_proj2 = nn.Linear(time_embed_dim, 384)
+        
+        # Bottleneck: 384 -> 512 channels, 32 sequence length (no downsampling)
+        # This is where the model processes the most compressed representation
+        self.bottleneck = nn.Sequential(
+            nn.Conv1d(384, 512, kernel_size=3, padding=1),
+            nn.GroupNorm(8, 512),
+            nn.SiLU(),
+            nn.Conv1d(512, 512, kernel_size=3, padding=1),
+            nn.GroupNorm(8, 512),
+            nn.SiLU(),
+            nn.Conv1d(512, 384, kernel_size=3, padding=1),  # Back to 384 for skip connection
+            nn.GroupNorm(8, 384),
             nn.SiLU(),
         )
         
-        self.decoder = nn.Sequential(
-            nn.Conv1d(hidden_dim, hidden_dim, 3, padding=1),
-            nn.GroupNorm(8, hidden_dim),
+        # Time projection for bottleneck
+        self.time_proj_bottleneck = nn.Linear(time_embed_dim, 384)
+        
+        # Decoder (upsampling path with skip connections)
+        # Skip connections help preserve semantic details lost during downsampling
+        
+        # Upsampling layers (applied before concatenation)
+        self.up2_upsample = nn.ConvTranspose1d(384, 384, kernel_size=4, stride=2, padding=1)
+        self.up1_upsample = nn.ConvTranspose1d(256, 256, kernel_size=4, stride=2, padding=1)
+        
+        # Block 3: (384 + 384) -> 256 channels, after upsampling to 64 sequence length
+        self.up2 = nn.Sequential(
+            nn.Conv1d(384 + 384, 384, kernel_size=3, padding=1),  # +384 from skip connection
+            nn.GroupNorm(8, 384),
             nn.SiLU(),
-            nn.Conv1d(hidden_dim, out_channels, 3, padding=1),
+            nn.Conv1d(384, 256, kernel_size=3, padding=1),
+            nn.GroupNorm(8, 256),
+            nn.SiLU(),
+        )
+        
+        # Time projection for up2
+        self.time_proj3 = nn.Linear(time_embed_dim, 256)
+        
+        # Block 4: (256 + 256) -> 256 channels, after upsampling to 128 sequence length
+        self.up1 = nn.Sequential(
+            nn.Conv1d(256 + 256, 256, kernel_size=3, padding=1),  # +256 from skip connection
+            nn.GroupNorm(8, 256),
+            nn.SiLU(),
+            nn.Conv1d(256, 256, kernel_size=3, padding=1),
+            nn.GroupNorm(8, 256),
+            nn.SiLU(),
+        )
+        
+        # Time projection for up1
+        self.time_proj4 = nn.Linear(time_embed_dim, 256)
+        
+        # Final output layer: back to original 768 channels
+        # This maps from processed features back to BART embedding space
+        self.final = nn.Sequential(
+            nn.Conv1d(256, 256, kernel_size=3, padding=1),
+            nn.GroupNorm(8, 256),
+            nn.SiLU(),
+            nn.Conv1d(256, out_channels, kernel_size=1),  # 1x1 conv for final projection
         )
         
     def forward(self, x, timesteps):
-        # Time embedding (not used in this simple version)
-        t = timesteps.float().unsqueeze(-1) / 1000.0
-        t_emb = self.time_embed(t)
+        """
+        Forward pass through the text-specific UNet.
         
-        # Simple forward pass
-        x = self.encoder(x)
-        x = self.middle(x)
-        x = self.decoder(x)
+        Args:
+            x: [batch_size, 768, 128] - noisy BART latents
+            timesteps: [batch_size] - diffusion timesteps
+            
+        Returns:
+            [batch_size, 768, 128] - predicted noise
+        """
+        batch_size = x.shape[0]
         
-        return x
+        # Embed timesteps - this tells the model "how noisy" the input is
+        t = timesteps.float().unsqueeze(-1) / 1000.0  # Normalize to [0, 1]
+        t_emb = self.time_embed(t)  # [batch_size, time_embed_dim]
+        
+        # Encoder path with skip connection storage
+        # Down1: 768 -> 256 channels, 128 -> 64 length
+        skip1 = self.down1(x)  # Store for skip connection
+        skip1 = skip1 + self.time_proj1(t_emb).unsqueeze(-1)  # Add time information
+        x1 = self.down1_pool(skip1)
+        
+        # Down2: 256 -> 384 channels, 64 -> 32 length  
+        skip2 = self.down2(x1)  # Store for skip connection
+        skip2 = skip2 + self.time_proj2(t_emb).unsqueeze(-1)  # Add time information
+        x2 = self.down2_pool(skip2)
+        
+        # Bottleneck: process the most compressed representation
+        x3 = self.bottleneck(x2)
+        x3 = x3 + self.time_proj_bottleneck(t_emb).unsqueeze(-1)  # Add time information
+        
+        # Decoder path with skip connections
+        # Up2: 32 -> 64 length, use skip connection from down2
+        x4 = self.up2_upsample(x3)  # First upsample, then concatenate
+        # Ensure dimensions match for concatenation
+        if x4.shape[-1] != skip2.shape[-1]:
+            # Adjust skip2 to match x4's sequence length
+            skip2 = F.interpolate(skip2, size=x4.shape[-1], mode='linear', align_corners=False)
+        x4 = torch.cat([x4, skip2], dim=1)  # Concatenate skip connection
+        x4 = self.up2(x4)
+        x4 = x4 + self.time_proj3(t_emb).unsqueeze(-1)  # Add time information
+        
+        # Up1: 64 -> 128 length, use skip connection from down1
+        x5 = self.up1_upsample(x4)  # First upsample, then concatenate
+        # Ensure dimensions match for concatenation
+        if x5.shape[-1] != skip1.shape[-1]:
+            # Adjust skip1 to match x5's sequence length
+            skip1 = F.interpolate(skip1, size=x5.shape[-1], mode='linear', align_corners=False)
+        x5 = torch.cat([x5, skip1], dim=1)  # Concatenate skip connection
+        x5 = self.up1(x5)
+        x5 = x5 + self.time_proj4(t_emb).unsqueeze(-1)  # Add time information
+        
+        # Final output: back to 768 channels (BART embedding space)
+        output = self.final(x5)
+        
+        return output
 
 def validate_model(model, val_loader, scheduler, criterion, device):
     """Validate the model."""
@@ -190,7 +315,9 @@ def train_denoiser(
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 ) -> Dict[str, List[float]]:
     """Train the denoising model with validation."""
+    print(f"Starting training on device: {device}")
     model = model.to(device)
+    print(f"Model is on device: {next(model.parameters()).device}")
     
     # Optimizer
     optimizer = torch.optim.AdamW(
@@ -304,15 +431,15 @@ def main():
     # Initialize wandb
     wandb.init(
         project="text-diffusion",
-        name="bart-denoiser-v3-simple",
+        name="bart-denoiser-v5-text-unet",
         config={
-            "model_type": "SimpleUNet1D",
+            "model_type": "TextUNet1D",
             "encoder": "BART-base",
             "dataset": "WikiText-2",
-            "batch_size": 32,  # Larger batch size
+            "batch_size": 32,
             "learning_rate": 1e-4,
             "num_epochs": 2,
-            "max_length": 128,  # Smaller for efficiency
+            "max_length": 128,
             "noise_scheduler": "cosine",
             "num_timesteps": 1000,
             "optimizer": "AdamW",
@@ -320,7 +447,11 @@ def main():
             "weight_decay": 0.01,
             "gradient_clipping": 1.0,
             "normalization": "latent_normalization",
-            "architecture": "simple_unet_no_skip_connections"
+            "architecture": "custom_text_unet_with_skip_connections",
+            "time_embed_dim": 256,
+            "downsampling_strategy": "gentle_2x_per_block",
+            "skip_connections": True,
+            "attention_mechanisms": False
         }
     )
     
@@ -342,8 +473,8 @@ def main():
     val_size = len(full_dataset) - train_size
     train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size])
     
-    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, num_workers=2)
-    val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False, num_workers=2)
+    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, num_workers=0)
+    val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False, num_workers=0)
     
     # Log dataset info
     wandb.log({
@@ -353,9 +484,9 @@ def main():
         "dataset/val_batches": len(val_loader)
     })
     
-    # Create simple model
-    print("Creating simple UNet model...")
-    model = SimpleUNet1D(in_channels=768, out_channels=768, hidden_dim=256)
+    # Create text-specific UNet model
+    print("Creating TextUNet1D model for BART semantic latents...")
+    model = TextUNet1D(in_channels=768, out_channels=768, time_embed_dim=256)
     
     # Create noise scheduler
     scheduler = CosineNoiseScheduler(num_timesteps=1000)
@@ -375,11 +506,11 @@ def main():
     })
     
     # Save final model
-    torch.save(model.state_dict(), "final_simple_denoiser.pt")
+    torch.save(model.state_dict(), "final_text_unet_denoiser.pt")
     
     # Save models as wandb artifacts
-    for model_name in ["best_simple_denoiser.pt", "final_simple_denoiser.pt"]:
-        artifact = wandb.Artifact(f"simple-denoiser-{model_name.split('_')[0]}", type="model")
+    for model_name in ["best_simple_denoiser.pt", "final_text_unet_denoiser.pt"]:
+        artifact = wandb.Artifact(f"text-unet-denoiser-{model_name.split('_')[0]}", type="model")
         artifact.add_file(model_name)
         wandb.log_artifact(artifact)
     
