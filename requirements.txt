@@ -5,3 +5,4 @@ tqdm>=4.66.3
 transformers>=4.30.0  # We might need this for tokenization
 pandas>=2.0.0  # For data manipulation
 sentence-transformers>=2.2.2  # For SBERT embeddings 
+wandb

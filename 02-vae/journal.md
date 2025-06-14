@@ -1,10 +1,41 @@
+To make a VAE I need an encoder and a decoder. I tested SBERT and then BART encoders.
+
+We can easily roll our own I think but there's a paper called Optimus https://arxiv.org/abs/2004.04092 https://github.com/ChunyuanLI/Optimus that shows a text VAE and they use Bert for encoding and GPT-2 for decoding. 
+
+# SBERT encoding 
+From SBERT (https://sbert.net) we have "A wide selection of over [10,000 pre-trained Sentence Transformers models](https://huggingface.co/models?library=sentence-transformers) are available for immediate use on 🤗 Hugging Face." SBERT is for sentence encoding—pretty much just what we want.
+
+I did a little test of SBERT:
+```
+Similarity between:
+1. 'The cat sat on the mat'
+2. 'A feline rested on the carpet'
+Similarity score: 0.5686
+
+Similarity between:
+1. 'The cat sat on the mat'
+2. 'The stock market crashed today'
+Similarity score: 0.0940
+
+Similarity between:
+1. 'A feline rested on the carpet'
+2. 'The stock market crashed today'
+Similarity score: 0.0534
+
+Embedding dimension: 384
+```
+
+These results are great; similar sentences have high similarity, dissimilar sentences have miniscule similarity.
+
+However, SBERT is intended for sentiment and similarity analysis. Although all we need is encoded latents, training my own decoder might be avoidable.
+
 # BART Autoencoding Analysis
 
-This project analyzes the autoencoding capabilities of the BART model on text blocks of varying lengths using the WikiText-2 dataset.
+Gemini recommended the BART decoder https://huggingface.co/docs/transformers/en/model_doc/bart which was introduced in BART: Denoising Sequence-to-Sequence Pre-training for Natural Language Generation, Translation, and Comprehension, Lewis et al, 2019 (https://arxiv.org/abs/1910.13461). Since we're doing a seq2seq task this may be more ideal. The 768-dimensional space is richer than SBERT's 384-dimensional space, but I did notice that similar sentences have a high similarity of 0.87 and dissimilar sentences also have a high similarity of about 0.6. Hopefully this doesn't impact the VAE's performance.
 
-## Analysis Overview
+## BART context length analysis
 
-We tested BART's ability to reconstruct text blocks of different lengths (10-512 words) and measured two key metrics:
+How large of a block size should we use? We tested BART's ability to encode and then reconstruct text blocks of different lengths (10-512 words) and measured two key metrics:
 1. Exact Match Rate: Percentage of blocks that are reconstructed perfectly
 2. Word Match Ratio: Percentage of original words preserved in the reconstruction
 
@@ -32,33 +63,12 @@ The analysis shows a clear relationship between text length and reconstruction f
   - 92.6% word match ratio
   - Noticeable degradation in word preservation
 
-## Visualization
-
 ![BART Autoencoding Fidelity Analysis](bart_fidelity_analysis.png)
 
-## Key Findings
+So we can expect good performance up until 300 tokens, probably.
 
-1. BART performs exceptionally well on short text blocks (≤50 words), maintaining perfect word preservation and high exact match rates.
-2. For longer blocks, while word preservation remains high (≥92.6%), exact matches become rare.
-3. The model shows a gradual degradation in performance as text length increases, with a significant drop in exact matches after 50 words.
+# But both models are autoregressive
 
-## Recommendations
+From the demos of diffusion LLMs I've seen, the decoding process looks like it's done in one pass, not autoregressively. Reading Diffusion-LM (2022), I see that the latent is a sequence of embeddings, not a single vector; each embedding decodes noisily (is "rounded off") to a token.
 
-1. For applications requiring high-fidelity autoencoding, keep text blocks to 50 words or fewer.
-2. For longer texts, expect some reordering but good word preservation up to 300 words.
-3. For very long texts (>300 words), consider chunking or alternative approaches.
-
-## Technical Details
-
-- Model: BART-base
-- Dataset: WikiText-2
-- Sample Size: 10% of dataset
-- Test Samples: 10 blocks per length range
-- Metrics: Exact match rate and word match ratio
-
-## Files
-
-- `test_bart_length.py`: Script for testing BART's autoencoding capabilities
-- `plot_bart_results.py`: Script for visualizing the results
-- `bart_results.json`: Raw results data
-- `bart_fidelity_analysis.png`: Visualization of results 
+For the moment I'll pursue autoregressive decoding. Even though it won't work it should be fun and educational.
