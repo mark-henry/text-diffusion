@@ -11,24 +11,20 @@ import time
 from typing import List, Tuple, Dict
 import torch.nn.functional as F
 
-class CosineNoiseScheduler:
-    def __init__(self, num_timesteps: int = 1000, beta_start: float = 0.0001, beta_end: float = 0.02):
+class SqrtNoiseScheduler:
+    def __init__(self, num_timesteps: int = 2000, s: float = 1e-4):
         self.num_timesteps = num_timesteps
-        self.beta_start = beta_start
-        self.beta_end = beta_end
+        self.s = s
         
-        self.betas = self._cosine_beta_schedule(num_timesteps, beta_start, beta_end)
-        self.alphas = 1 - self.betas
-        self.alphas_cumprod = torch.cumprod(self.alphas, dim=0)
+        # Compute alphas_cumprod using sqrt schedule: α¯t = 1 - √(t/T + s)
+        t = torch.linspace(0, num_timesteps, num_timesteps + 1)
+        alphas_cumprod = 1 - torch.sqrt(t / num_timesteps + s)
+        alphas_cumprod = alphas_cumprod / alphas_cumprod[0]  # Normalize to start at 1
         
-    def _cosine_beta_schedule(self, timesteps, beta_start=0.0001, beta_end=0.02, s=0.008):
-        """Cosine schedule as proposed in https://arxiv.org/abs/2102.09672"""
-        steps = timesteps + 1
-        x = torch.linspace(0, timesteps, steps)
-        alphas_cumprod = torch.cos(((x / timesteps) + s) / (1 + s) * torch.pi * 0.5) ** 2
-        alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
-        betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
-        return torch.clip(betas, beta_start, beta_end)
+        # Compute betas from alphas_cumprod
+        self.alphas_cumprod = alphas_cumprod
+        self.alphas = alphas_cumprod[1:] / alphas_cumprod[:-1]
+        self.betas = 1 - self.alphas
         
     def add_noise(self, latents: torch.Tensor, timesteps: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Add noise to latents according to timesteps."""
@@ -47,8 +43,8 @@ def pad_tensor(tensor: torch.Tensor, max_length: int) -> torch.Tensor:
     if current_length >= max_length:
         return tensor[:max_length]
     
-    # Create padding
-    padding = torch.zeros((max_length - current_length, tensor.shape[1]), dtype=tensor.dtype)
+    # Create padding on the same device as the input tensor
+    padding = torch.zeros((max_length - current_length, tensor.shape[1]), dtype=tensor.dtype, device=tensor.device)
     return torch.cat([tensor, padding], dim=0)
 
 class LatentDataset(Dataset):
@@ -308,7 +304,7 @@ def validate_model(model, val_loader, scheduler, criterion, device):
 
 def train_denoiser(
     model: nn.Module,
-    scheduler: CosineNoiseScheduler,
+    scheduler: SqrtNoiseScheduler,
     train_loader: DataLoader,
     val_loader: DataLoader,
     num_epochs: int = 2,
@@ -378,6 +374,12 @@ def train_denoiser(
             pred_flat = predicted_noise.reshape(batch_size, -1)
             cosine_sim = F.cosine_similarity(noise_flat, pred_flat, dim=1).mean()
             
+            # Calculate noise level (signal-to-noise ratio)
+            alphas_cumprod = scheduler.alphas_cumprod.to(device)[timesteps]
+            signal_level = torch.sqrt(alphas_cumprod)
+            noise_level = torch.sqrt(1 - alphas_cumprod)
+            snr = (signal_level / noise_level).mean()
+            
             epoch_loss += loss.item()
             epoch_cosine_sim += cosine_sim.item()
             
@@ -390,6 +392,9 @@ def train_denoiser(
                     "train/grad_norm": grad_norm.item(),
                     "train/batch": batch_idx,
                     "train/epoch": epoch,
+                    "train/signal_to_noise_ratio": snr.item(),
+                    "train/signal_level": signal_level.mean().item(),
+                    "train/noise_level": noise_level.mean().item(),
                 })
         
         # Validation
@@ -440,8 +445,9 @@ def main():
             "learning_rate": 1e-4,
             "num_epochs": 2,
             "max_length": 128,
-            "noise_scheduler": "cosine",
-            "num_timesteps": 1000,
+            "noise_scheduler": "sqrt",
+            "num_timesteps": 2000,
+            "s": 1e-4,
             "optimizer": "AdamW",
             "lr_scheduler": "CosineAnnealing",
             "weight_decay": 0.01,
@@ -488,8 +494,8 @@ def main():
     print("Creating TextUNet1D model for BART semantic latents...")
     model = TextUNet1D(in_channels=768, out_channels=768, time_embed_dim=256)
     
-    # Create noise scheduler
-    scheduler = CosineNoiseScheduler(num_timesteps=1000)
+    # Create noise scheduler with sqrt schedule
+    scheduler = SqrtNoiseScheduler(num_timesteps=2000, s=1e-4)
     
     # Train model
     print("Training denoising model...")
