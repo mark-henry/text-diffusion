@@ -128,3 +128,57 @@ We tested three different UNet architectures for denoising BART latent represent
 ### Conclusion
 
 The TextUNet1D represents a reasonable compromise between architectural complexity and performance for denoising BART latents. While the ~0.25-0.30 cosine similarity suggests room for improvement, this establishes a solid baseline for text diffusion experiments. The next step would be exploring transformer-based denoisers or different approaches to text generation entirely.
+
+## Update: Sqrt Noise Schedule and Improved Denoising Results
+
+We recently switched from the cosine noise schedule to a square root (sqrt) noise schedule, as described in the referenced paper. This change was motivated by the observation that standard noise schedules are not robust for text data. The sqrt schedule starts with a higher noise level and increases rapidly for the first 50 steps, which better matches the characteristics of text data.
+
+### Results
+
+- **Cosine Similarity**: The model now achieves a cosine similarity of 0.3, an improvement over the previous results.
+- **Denoising Quality**: When tested on garbled text, the denoiser produced fairly lucid outputs. Although the outputs are still somewhat repetitive, they are significantly more coherent and "Wikipedia-like" compared to the heavily corrupted input.
+
+```
+Example 1:
+Original text: The quick brown fox jumps over the lazy dog. This is a test of the denoising model.
+Garbled text: brown quick The fox jumps the over is the This lazy dog. test of a model. denoising
+DEBUG: latents shape after encoder: torch.Size([1, 23, 768])
+DEBUG: latents shape before pad_tensor: torch.Size([23, 768])
+DEBUG: latents shape after pad_tensor: torch.Size([128, 768])
+DEBUG: latents shape before denoiser: torch.Size([1, 768, 128])
+DEBUG: denoised_latents shape before unnorm: torch.Size([1, 768, 128])
+DEBUG: latent_mean shape before unnorm: torch.Size([768])
+DEBUG: latent_std shape before unnorm: torch.Size([768])
+DEBUG: latent_mean_reshape: torch.Size([1, 768, 1])
+DEBUG: latent_std_reshape: torch.Size([1, 768, 1])
+Denoised text: The The The The U.S. Military The The United States Military The U is the U. S. Military is of a model. This. is the model of a dog... test of a models. deno
+--------------------------------------------------------------------------------
+
+Example 2:
+Original text: Machine learning is a field of study in artificial intelligence concerned with the development of algorithms that can learn from and make predictions on data.
+Garbled text: intelligence learning concerned of field of from with artificial study predictions a the development and algorithms that learn can Machine data. is make on in
+DEBUG: latents shape after encoder: torch.Size([1, 28, 768])
+DEBUG: latents shape after squeeze: torch.Size([28, 768])
+DEBUG: latent_mean shape before squeeze: torch.Size([1, 1, 768])
+DEBUG: latent_std shape before squeeze: torch.Size([1, 1, 768])
+DEBUG: latent_mean shape after squeeze: torch.Size([768])
+DEBUG: latent_std shape after squeeze: torch.Size([768])
+DEBUG: latents shape before pad_tensor: torch.Size([28, 768])
+DEBUG: latents shape after pad_tensor: torch.Size([128, 768])
+DEBUG: latents shape before denoiser: torch.Size([1, 768, 128])
+DEBUG: denoised_latents shape before unnorm: torch.Size([1, 768, 128])
+DEBUG: latent_mean shape before unnorm: torch.Size([768])
+DEBUG: latent_std shape before unnorm: torch.Size([768])
+DEBUG: latent_mean_reshape: torch.Size([1, 768, 1])
+DEBUG: latent_std_reshape: torch.Size([1, 768, 1])
+Denoised text: intelligenceintelligenceintelligenceinsinsinset of the of of of the artificialintelligence and the of the intelligence that learn, learn can. is make on in
+--------------------------------------------------------------------------------
+
+Example 3:
+Original text: The solar system consists of the Sun and everything that orbits around it, including planets, moons, asteroids, comets, and meteoroids.
+Garbled text: planets, solar system consists everything the Sun and of that orbits around it, meteoroids. ThDEBUG: latents shape after encoder: torch.Size([1, 31, 768])
+Denoised text: . The solar system consists everything. The core. The nucleus. The names. The functions. The 
+services. The programs. The service.The services.The service. The Services. The Service.The Services.The moons. The including moons.
+```
+
+This improvement suggests that the sqrt noise schedule is more suitable for text denoising tasks, providing a more robust training signal and better generalization.
