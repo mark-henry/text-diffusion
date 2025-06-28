@@ -164,3 +164,165 @@ This represents the first successful generation of coherent English text from a 
 - The foundation is in place for more sophisticated content-aware generation
 
 **Status**: 🎯 **Breakthrough achieved** - coherent text generation established, now optimizing for input fidelity and content preservation.
+
+## 2025-01-27 - CRITICAL DISCOVERY: t=0 Embedding Alignment 🚨
+
+### Major Breakthrough in Understanding Diffusion-LM
+
+**CRITICAL INSIGHT DISCOVERED**: After reading the authors' original Diffusion-LM implementation, found that **embedding alignment is ONLY applied when t=0** (final denoising step), not throughout the entire diffusion process as previously implemented.
+
+### Authors' Original Implementation
+```python
+terms["mse"] = mean_flat((target - model_output) ** 2)
+model_out_x_start = self.x0_helper(model_output, x_t, t)['pred_xstart']
+t0_mask = (t == 0)
+t0_loss = mean_flat((x_start_mean - model_out_x_start) ** 2)
+terms["mse"] = th.where(t0_mask, t0_loss, terms["mse"])
+```
+
+### Key Understanding
+- **t > 0**: Model learns pure **denoising dynamics** without embedding constraints
+- **t = 0**: Model is constrained to produce outputs that align with actual text embeddings
+- This allows **flexible intermediate representations** during most of training
+- Only enforces "rounding" to valid text at the very final step
+
+### Impact on Current Results
+
+**Previous Implementation (Incorrect)**:
+- Applied embedding loss at ALL timesteps: `||EMB(w) - μ_θ(x_1, 1)||²`
+- Over-constrained the model throughout training
+- Likely cause of "generic Wikipediaese" output - model converges to safe, generic text
+
+**Corrected Implementation**:
+- Embedding alignment ONLY at t=0: `terms["mse"] = th.where(t0_mask, t0_loss, terms["mse"])`
+- Allows model to learn effective denoising in intermediate latent space
+- Should enable more input-specific, varied outputs
+
+### Expected Improvements
+
+1. **Higher Input Sensitivity**: Model should generate outputs more closely related to input text
+2. **Reduced Generic Output**: Less convergence to "police investigation" or "personal drama" themes  
+3. **Better Content Preservation**: Maintain semantic content from original text
+4. **More Diverse Generation**: Avoid defaulting to generic Wikipedia-style content
+
+## Results 
+Unfortunately the model succumbed to modal collapse:
+
+```
+🟢 ORIGINAL: A number of design faults of the Tetrarch were revealed through its operational use . Its size limited the possible crew to three , a driver in the hu...
+
+🔵 t=   0 (  0.0% noise):
+   But then again, it's hard to see why not. The problem is that most people don't know what to do with themselves. They're...
+
+🔵 t=  50 (  0.2% noise):
+   But then again, it's hard to see why not. The problem is that most people don't know what to do with themselves. They're...
+
+🔵 t= 500 ( 15.3% noise):
+   But then again, it's hard to see why not. The problem is that most people don't know what to do with themselves. They're...
+
+🔵 t=1500 ( 85.6% noise):
+   But then again, it's hard to see why not. The problem is that most people don't know what to do with themselves. They're...
+```
+
+This is counter to claude's prediction of higher input sensitivity. Although the embedding distance loss encourages the weights to be far apart from each other, it's not as strong as the standard diffusion loss, so all embeddings clump up, and so the "But then again, it's hard to see why not" output is close enough to any input.
+
+
+# 2025-06-28 weight tying
+
+Now we convert the model output to vocabulary logits using weight tying, instead of manually measuring distances to 
+
+After just 2 epochs we already have some of the same vibes:
+
+🎭 VALIDATION DEMO - Denoising at timestep 1:
+📝 Original: Robert Boulter is an English film , television and theatre actor . He had a guest @-@ starring role on the television series The Bill in 2000 . This was followed by a starring role in the play Herons written by Simon Stephens , which was performed in 2001 at the Royal Court Theatre . He had
+🟢 Denoised:  000 Iniath is an United film , film and album album . The had a film @-@ praised work on the film game The United in John . It was been by a praised work in the work Inia released by York
+
+By epoch 4, we see the ability to reinterpret a sammple sequence given a little bit of noise, which is fun and exciting:
+
+🎭 VALIDATION DEMO - Denoising at timestep 1:
+📝 Original: Robert Boulter is an English film , television and theatre actor . He had a guest @-@ starring role on the television series The Bill in 2000 . This was followed by a starring role in the play Herons written by Simon Stephens , which was performed in 2001 at the Royal Court Theatre . He had 
+🟢 Denoised:  Alice Backman is an American film , song and album music . He had a music @-@ featuring version on the song series The John in 2006 . It was including by a featuring version in the show Heie released by Thomas Tina , which was performed in 2006 at the Park Church Music . He had
+📊 Cosine Similarity: 0.6452
+
+By epoch 7 we see that there is kind of a thesaurus effect on some words and otherwise the reconstruction is excellent
+
+🎭 VALIDATION DEMO - Denoising at timestep 1:
+📝 Original: Robert Boulter is an English film , television and theatre actor . He had a guest @-@ starring role on the television series The Bill in 2000 . This was followed by a starring role in the play Herons written by Simon Stephens , which was performed in 2001 at the Royal Court Theatre . He had
+🟢 Denoised:  Nicole Bonter is an English film , television and singer actor . He had a guest @-@ featuring role on the television series The John in 2000 . This was followed by a featuring role in the play Herans written by Robert Liz , which was performed in 1990 at the Royal School Theatre . He had
+📊 Cosine Similarity: 0.6797
+
+And after just 14 epochs the reconstruction is pretty much perfect
+
+📝 Original: Robert Boulter is an English film , television and theatre actor . He had a guest @-@ starring role on the television series The Bill in 2000 . This was followed by a starring role in the play Herons written by Simon Stephens , which was performed in 2001 at the Royal Court Theatre . He had
+🟢 Denoised:  Brandon Boulter is an English film , television and theatre actor . He had a guest @-@ starring role on the television series The Bill in 2000 . This was followed by a starring role in the play Herons written by Simon Stephens , which was performed in 2001 at the Royal Court Theatre . He had
+📊 Cosine Similarity: 0.8271
+
+Ended up at 0.96 similarity after epoch 42.
+
+```
+================================================================================
+🎯 DENOISING EXAMPLES
+================================================================================
+
+============================================================
+📝 EXAMPLE 1: Boats of the Type UB I design were built by two manufacturers , Germaniawerft of...
+============================================================
+
+🔵 Denoised from t=   0 (  0.0% noise):
+technats of the Type UB I design were built by two manufacturers , Germaniawerft of Kiel and AG Weser of Bremen , which led to some variations in boats from the two shipyards . The eight Germaniawerft @-@ built boats were slightly longer at 28 @.
+
+🔵 Denoised from t= 500 ( 15.3% noise):
+technats of the Type UB I design were built by two manufacturers , Germaniawerft of Kiel and AG Weser of Bremen , which led to some variations in boats from the two shipyards . The eight Germaniawerft @-@ built boats were slightly longer at 28 @.
+📊 Cosine Similarity: 0.9418
+
+🔵 Denoised from t=1500 ( 85.6% noise):
+technats of the Type UB I design were built by two manufacturers , Germaniawer90 of Kiel and AG Weser of Barren , which led to some variations in boats from the two shipyards . The eight Germaniawerft @-@ built boats were slightly longer at 28 @.
+📊 Cosine Similarity: 0.8586
+
+🔵 Denoised from t=1700 ( 94.6% noise):
+ The Operations Z of the November UB The review were built July two batteries , Germania En90 of was64 and Mu Louiser of B Anin , which prior to some addition in to from the two had crew . The abandoned Germania 3170 @-@ built flew were slightly least at 28 @.
+📊 Cosine Similarity: 0.7555
+
+============================================================
+📝 EXAMPLE 2: " Weevils Wobble But They Don 't Go Down " was written by Phil Klemmer and direc...
+============================================================
+
+🔵 Denoised from t=   0 (  0.0% noise):
+ォ Weevils Wobble But They Don 't Go Down " was written by Phil Klemmer and directed by Jason Bloom , marking Klemmer 's fifteenth and final writing credit and Bloom 's fourth and final directing credit for Veronica Mars , after " Green @-@ Eyed Monster
+
+🔵 Denoised from t= 500 ( 15.3% noise):
+ォ Weevils Wobble But They Don 't Go Down " was written by Phil Klemmer and directed by Jason Bloom , marking Klemmer 's fifteenth and final writing credit and Bloom 's fourth and final directing credit for Veronica Mars , after " Green @-@ Eyed Monster
+📊 Cosine Similarity: 0.9376
+
+🔵 Denoised from t=1500 ( 85.6% noise):
+mercial Weevils Wobble But They Don 'b Go Down " was written by Phil Klemmer and directed by Jason Bloom , marking Klemmer 's tenventh and final working credit and Bloom 's fourth and final directing credit for Veronica Mars , after " Green @-@ Illed Sony
+📊 Cosine Similarity: 0.8465
+
+🔵 Denoised from t=1700 ( 94.6% noise):
+ Itvari We reports Dress W 2 down But They Don ' or St Williams " Scott written by Josh Kfmer and directed by Matt Ross , carry Thomasbak 'sdal Weekend and final New Will and Halo 's fourth and final filming credit for the Kim , after interview Green @-@ Tooed Billy
+📊 Cosine Similarity: 0.7092
+
+============================================================
+📝 EXAMPLE 3: Throughout January 17 the tropical storm would again oscillate in strength , res...
+============================================================
+
+🔵 Denoised from t=   0 (  0.0% noise):
+avorable January 17 the tropical storm would again Coordate in strength , resulting in a briefitored by the JTWC to tropical depression intensity . However , an increase in deep convection resulted in its reclassification as a tropical storm at 1800 UTC that day , followed by the JMA Coord the system to tropical
+
+🔵 Denoised from t= 500 ( 15.3% noise):
+avorable January 17 the tropical storm would again Coordate in strength , resulting in a briefitored by the JTWC to tropical depression intensity . However , an increase in deep convection resulted in its reclassification as a tropical storm at 1800 UTC that day , followed by the JMA Acceler the system to tropical
+📊 Cosine Similarity: 0.9298
+
+🔵 Denoised from t=1500 ( 85.6% noise):
+gradation January 17 the tropical storm would again Processingate in strength , resulting in a briefitored by the JTSC to tropical depression intensity . However , an increase in weak destroyction resulted in its reclassification as a tropical storm at 1800 Conver that day , followed by the J SA intens the system to tropical
+📊 Cosine Similarity: 0.8535
+
+🔵 Denoised from t=1700 ( 94.6% noise):
+ agreements announced 17 the tropical storm will while Gulfate in strength , surrounding in a limited logistics by the JTZ by tropical depression significant . However , an approximately in deep convection resulted in its U systemification as a tropical 1960 at summer 261 that day , 27 by the JM typh the system to tropical the
+📊 Cosine Similarity: 0.7315
+```
+
+This is excellent. Let's try with a square-root noise function.
+
+## Square root noise schedule
+

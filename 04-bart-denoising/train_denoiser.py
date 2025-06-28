@@ -1,340 +1,44 @@
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader, random_split
-from transformers import BartForConditionalGeneration, BartTokenizer
+from torch.utils.data import DataLoader, random_split
+from transformers import BartTokenizer
 from tqdm import tqdm
 from datasets import load_dataset
 import wandb
 import time
+import os
 from typing import List, Tuple, Dict
 import torch.nn.functional as F
 
-class CosineNoiseScheduler:
-    def __init__(self, num_timesteps: int = 2000, s: float = 0.008):
-        self.num_timesteps = num_timesteps
-        self.s = s
-        
-        # Compute alphas_cumprod using cosine schedule: α¯t = cos(((t/T) + s) / (1 + s) * π/2)²
-        t = torch.linspace(0, num_timesteps, num_timesteps + 1)
-        alphas_cumprod = torch.cos(((t / num_timesteps) + s) / (1 + s) * torch.pi * 0.5) ** 2
-        alphas_cumprod = alphas_cumprod / alphas_cumprod[0]  # Normalize to start at 1
-        
-        # Ensure no negative values and proper bounds
-        alphas_cumprod = torch.clamp(alphas_cumprod, min=1e-8, max=1.0)
-        
-        # Compute betas from alphas_cumprod
-        self.alphas_cumprod = alphas_cumprod
-        self.alphas = alphas_cumprod[1:] / alphas_cumprod[:-1]
-        self.betas = 1 - self.alphas
-        
-    def add_noise(self, latents: torch.Tensor, timesteps: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Add noise to latents according to timesteps."""
-        noise = torch.randn_like(latents)
-        # Move alphas_cumprod to same device as timesteps
-        alphas_cumprod = self.alphas_cumprod.to(timesteps.device)[timesteps]
-        
-        # Reshape for broadcasting with [B, C, L] format
-        alphas_cumprod = alphas_cumprod.view(-1, 1, 1)
-        noisy_latents = torch.sqrt(alphas_cumprod) * latents + torch.sqrt(1 - alphas_cumprod) * noise
-        return noisy_latents, noise
+# Set CUDA memory allocation configuration for better memory management
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 
-def pad_tensor(tensor: torch.Tensor, max_length: int) -> torch.Tensor:
-    """Pad tensor to max_length."""
-    current_length = tensor.shape[0]
-    if current_length >= max_length:
-        return tensor[:max_length]
-    
-    # Create padding on the same device as the input tensor
-    padding = torch.zeros((max_length - current_length, tensor.shape[1]), dtype=tensor.dtype, device=tensor.device)
-    return torch.cat([tensor, padding], dim=0)
+from denoiser import (
+    BartDiffusionLM, 
+    CosineNoiseScheduler, 
+    TextDataset, 
+    load_checkpoint,
+    get_substantial_texts_from_dataset,
+    demo_denoising_step,
+    token_discrete_loss
+)
 
-class TextDataset(Dataset):
-    """Dataset that returns raw text and token IDs for dynamic latent computation."""
-    def __init__(self, tokenizer: BartTokenizer, dataset: List[str], max_length: int):
-        self.tokenizer = tokenizer
-        self.dataset = [text for text in dataset if text.strip()]  # Filter empty texts
-        self.max_length = max_length
-
-    def __len__(self) -> int:
-        return len(self.dataset)
-    
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        text = self.dataset[idx]
-        inputs = self.tokenizer(text, return_tensors="pt", max_length=self.max_length, truncation=True, padding="max_length")
-        return {
-            'input_ids': inputs.input_ids.squeeze(0),  # Remove batch dimension
-            'attention_mask': inputs.attention_mask.squeeze(0)
-        }
-
-class BartDiffusionLM(nn.Module):
-    """
-    BART-based diffusion language model following Li et al. 2022 approach.
-    
-    Architecture:
-    - Uses BART's embedding layers (TRAINABLE) to handle latent -> embedding conversion
-    - Uses BART's transformer layers (TRAINABLE) for processing
-    - Predicts clean latents x_0 instead of noise
-    - Uses sinusoidal time embeddings for timestep conditioning
-    """
-    def __init__(self, bart_model_name="facebook/bart-base", max_length=64, time_embed_dim=256, num_timesteps=2000):
-        super().__init__()
-        self.max_length = max_length
-        self.num_timesteps = num_timesteps
-        self.time_embed_dim = time_embed_dim
-        
-        # Load BART model and extract components
-        from transformers import BartModel, BartConfig
-        self.bart_config = BartConfig.from_pretrained(bart_model_name)
-        bart_model = BartModel.from_pretrained(bart_model_name)
-        
-        # CRITICAL: Ensure max_length doesn't exceed BART's position embedding limit
-        max_pos_embeds = self.bart_config.max_position_embeddings
-        if max_length > max_pos_embeds:
-            print(f"Warning: max_length {max_length} exceeds BART's max_position_embeddings {max_pos_embeds}")
-            self.max_length = min(max_length, max_pos_embeds - 2)  # -2 for safety margin
-            print(f"Adjusted max_length to {self.max_length}")
-        
-        # Extract BART components
-        encoder = bart_model.encoder
-        
-        # TRAINABLE: BART's embedding layers (now learnable)
-        self.embed_tokens = encoder.embed_tokens
-        self.embed_positions = encoder.embed_positions  
-        self.layernorm_embedding = encoder.layernorm_embedding
-        
-        # Unfreeze embedding layers - make them trainable
-        for param in self.embed_tokens.parameters():
-            param.requires_grad = True
-        for param in self.embed_positions.parameters():
-            param.requires_grad = True
-        for param in self.layernorm_embedding.parameters():
-            param.requires_grad = True
-            
-        embedding_params = sum(p.numel() for p in self.embed_tokens.parameters()) + \
-                          sum(p.numel() for p in self.embed_positions.parameters()) + \
-                          sum(p.numel() for p in self.layernorm_embedding.parameters())
-        print(f"✅ Made BART embedding layers trainable ({embedding_params:,} trainable params)")
-        
-        # TRAINABLE: BART's transformer layers
-        self.transformer_layers = encoder.layers
-        
-        # Unfreeze transformer layers  
-        for param in self.transformer_layers.parameters():
-            param.requires_grad = True
-            
-        transformer_params = sum(p.numel() for p in self.transformer_layers.parameters() if p.requires_grad)
-        print(f"✅ Made BART transformer layers trainable ({transformer_params:,} trainable params)")
-        
-        # Time embedding layers (sinusoidal encoding + MLP)
-        self.time_embed = nn.Sequential(
-            nn.Linear(time_embed_dim, time_embed_dim),
-            nn.SiLU(),
-            nn.Linear(time_embed_dim, time_embed_dim),
-            nn.SiLU(),
-        )
-        
-        # Project time embedding into BART's embedding space for injection
-        self.time_proj = nn.Linear(time_embed_dim, self.bart_config.d_model)
-        
-        # Input projection layer to handle noisy latents -> BART embedding space
-        self.input_proj = nn.Linear(self.bart_config.d_model, self.bart_config.d_model)
-        
-        # Final projection to predict clean latents (same dim as input)
-        self.output_proj = nn.Sequential(
-            nn.Linear(self.bart_config.d_model, self.bart_config.d_model),
-            nn.LayerNorm(self.bart_config.d_model),
-            nn.SiLU(),
-            nn.Linear(self.bart_config.d_model, self.bart_config.d_model)  # 768 for BART-base
-        )
-        
-        # Note: We compute reconstruction loss directly using embedding similarities
-        # instead of a separate linear layer, which better enforces embedding separation
-    
-    def compute_clean_latents(self, input_ids, attention_mask=None):
-        """Compute clean latents from token IDs using BART's embedding layers."""
-        batch_size, seq_len = input_ids.shape
-        
-        # Ensure sequence length doesn't exceed BART's limits
-        if seq_len > self.max_length:
-            input_ids = input_ids[:, :self.max_length]
-            if attention_mask is not None:
-                attention_mask = attention_mask[:, :self.max_length]
-            seq_len = self.max_length
-        
-        # Token embeddings (now trainable!)
-        token_embeddings = self.embed_tokens(input_ids)
-        
-        # Position embeddings
-        position_ids = torch.arange(seq_len, device=input_ids.device).unsqueeze(0).expand(batch_size, -1)
-        position_embeddings = self.embed_positions(position_ids)
-        
-        # Combine embeddings
-        embeddings = token_embeddings + position_embeddings
-        
-        # Apply embedding normalization
-        embeddings = self.layernorm_embedding(embeddings)
-        
-        # Create attention mask for BART transformer layers
-        if attention_mask is None:
-            attention_mask = torch.ones(batch_size, seq_len, device=input_ids.device, dtype=torch.bool)
-        else:
-            # Ensure attention mask is bool type
-            attention_mask = attention_mask.bool()
-        
-        # Convert to 4D format for BART
-        attention_mask_4d = attention_mask.unsqueeze(1).unsqueeze(1).expand(batch_size, 1, seq_len, seq_len).bool()
-        
-        # Pass through transformer layers to get latent representations
-        hidden_states = embeddings
-        for layer in self.transformer_layers:
-            layer_outputs = layer(
-                hidden_states,
-                attention_mask=attention_mask_4d,
-                layer_head_mask=None,
-                output_attentions=False,
-            )
-            hidden_states = layer_outputs[0]
-        
-        return hidden_states
-
-    def get_learnable_embeddings(self, input_ids, attention_mask=None):
-        """
-        Get the learnable embeddings EMB(w) for the embedding loss component.
-        This is the trainable BART embedding representation.
-        """
-        batch_size, seq_len = input_ids.shape
-        
-        # Ensure sequence length doesn't exceed BART's limits
-        if seq_len > self.max_length:
-            input_ids = input_ids[:, :self.max_length]
-            if attention_mask is not None:
-                attention_mask = attention_mask[:, :self.max_length]
-            seq_len = self.max_length
-        
-        # Get trainable token embeddings (this is EMB(w) in the paper)
-        token_embeddings = self.embed_tokens(input_ids)
-        
-        # Position embeddings
-        position_ids = torch.arange(seq_len, device=input_ids.device).unsqueeze(0).expand(batch_size, -1)
-        position_embeddings = self.embed_positions(position_ids)
-        
-        # Combine embeddings and normalize
-        embeddings = token_embeddings + position_embeddings
-        embeddings = self.layernorm_embedding(embeddings)
-        
-        return embeddings
-
-    # predict_vocabulary_logits method removed - we now compute reconstruction loss
-    # directly using cosine similarities to vocabulary embeddings
-
-    def get_sinusoidal_embedding(self, timesteps, embedding_dim):
-        """
-        Create sinusoidal timestep embeddings like in original Transformer paper.
-        Following Diffusion-LM approach for time encoding.
-        """
-        half_dim = embedding_dim // 2
-        emb = torch.log(torch.tensor(10000.0, device=timesteps.device)) / (half_dim - 1)
-        emb = torch.exp(torch.arange(half_dim, dtype=torch.float32, device=timesteps.device) * -emb)
-        emb = timesteps[:, None].float() * emb[None, :]
-        emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=1)
-        if embedding_dim % 2 == 1:  # Zero pad
-            emb = torch.nn.functional.pad(emb, (0, 1, 0, 0))
-        return emb
-
-    def forward(self, noisy_latents, timesteps):
-        """
-        Forward pass: predict clean latents x_0 from noisy latents x_t and timestep t.
-        
-        Architecture:
-        1. Time embedding: sinusoidal encoding of timestep
-        2. Input projection: noisy latents -> BART embedding space
-        3. Time injection: add time embeddings to latent representations
-        4. BART transformer: process time-conditioned latents
-        5. Output projection: predict clean latents x_0
-        
-        Args:
-            noisy_latents: [B, L, C] noisy latents at timestep t
-            timesteps: [B] timestep indices
-            
-        Returns:
-            predicted_x0: [B, L, C] predicted clean latents
-        """
-        batch_size, seq_len, embed_dim = noisy_latents.shape
-        
-        # 1. Create time embeddings using sinusoidal encoding
-        time_emb = self.get_sinusoidal_embedding(timesteps, self.time_embed_dim).to(noisy_latents.device)
-        time_emb = self.time_embed(time_emb)  # [B, time_embed_dim]
-        
-        # 2. Project time embedding to BART's embedding dimension
-        time_proj = self.time_proj(time_emb)  # [B, d_model]
-        time_proj = time_proj.unsqueeze(1).expand(-1, seq_len, -1)  # [B, L, d_model]
-        
-        # 3. Project noisy latents to BART embedding space
-        latent_proj = self.input_proj(noisy_latents)  # [B, L, d_model]
-        
-        # 4. Add time information to latent representations
-        time_conditioned_latents = latent_proj + time_proj  # [B, L, d_model]
-        
-        # 5. Create attention mask (assume all positions are valid)
-        attention_mask = torch.ones(batch_size, seq_len, device=noisy_latents.device, dtype=torch.bool)
-        attention_mask_4d = attention_mask.unsqueeze(1).unsqueeze(1).expand(batch_size, 1, seq_len, seq_len).bool()
-        
-        # 6. Process through BART transformer layers
-        hidden_states = time_conditioned_latents
-        for layer in self.transformer_layers:
-            layer_outputs = layer(
-                hidden_states,
-                attention_mask=attention_mask_4d,
-                layer_head_mask=None,
-                output_attentions=False,
-            )
-            hidden_states = layer_outputs[0]
-        
-        # 7. Final projection to predict clean latents x_0
-        predicted_x0 = self.output_proj(hidden_states)
-        
-        return predicted_x0
-
-def load_checkpoint(model, checkpoint_path, device):
-    """
-    Load a model checkpoint and return the loaded state.
-    
-    Args:
-        model: The model to load weights into
-        checkpoint_path: Path to the checkpoint file
-        device: Device to load the model on
-        
-    Returns:
-        bool: True if checkpoint loaded successfully, False otherwise
-    """
-    try:
-        print(f"Loading checkpoint from: {checkpoint_path}")
-        checkpoint = torch.load(checkpoint_path, map_location=device)
-        
-        # Handle different checkpoint formats
-        if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
-            # Full checkpoint with training state
-            model.load_state_dict(checkpoint['model_state_dict'])
-            epoch = checkpoint.get('epoch', 0)
-            best_val_loss = checkpoint.get('best_val_loss', float('inf'))
-            print(f"✅ Loaded checkpoint from epoch {epoch} with best val loss: {best_val_loss:.6f}")
-            return True, epoch, best_val_loss
-        else:
-            # Simple state dict
-            model.load_state_dict(checkpoint)
-            print(f"✅ Loaded model weights from checkpoint")
-            return True, 0, float('inf')
-            
-    except Exception as e:
-        print(f"❌ Failed to load checkpoint: {e}")
-        return False, 0, float('inf')
-
-def validate_model(model, val_loader, scheduler, loss_fn, device):
+def validate_model(model, val_loader, scheduler, loss_fn, device, demo_text=None, bart_model=None, tokenizer=None):
     """Validate the model with the new Diffusion-LM loss."""
     model.eval()
     val_total_loss = 0
     val_cosine_sim = 0
     val_magnitude_ratio = 0
+    
+    # Track individual loss components for corrected loss function
+    val_diffusion_loss = 0
+    val_embedding_loss = 0
+    val_reconstruction_loss = 0
+    val_diffusion_loss_weighted = 0
+    val_embedding_loss_weighted = 0
+    val_reconstruction_loss_weighted = 0
+    val_t0_samples = 0
+    
     num_batches = 0
     
     # For loss vs timestep and cosine similarity vs timestep analysis
@@ -363,10 +67,22 @@ def validate_model(model, val_loader, scheduler, loss_fn, device):
             val_total_loss += loss_dict['total_loss'].item()
             val_cosine_sim += loss_dict['cosine_sim'].item()
             val_magnitude_ratio += loss_dict['magnitude_ratio'].item()
+            
+            # Track individual loss components (corrected for new loss function)
+            val_diffusion_loss += loss_dict['diffusion_loss'].item()
+            val_embedding_loss += loss_dict['embedding_loss'].item()
+            val_reconstruction_loss += loss_dict['reconstruction_loss'].item()
+            val_diffusion_loss_weighted += loss_dict['diffusion_loss_weighted'].item()
+            val_embedding_loss_weighted += loss_dict['embedding_loss_weighted'].item()
+            val_reconstruction_loss_weighted += loss_dict['reconstruction_loss_weighted'].item()
+            
+            # Track t=0 metrics
+            val_t0_samples += loss_dict['t0_samples']
+            
             num_batches += 1
             
             # Collect loss vs timestep and cosine similarity vs timestep data (sample every few batches to avoid too much data)
-            if num_batches % 5 == 0:  # Sample every 5th batch
+            if num_batches % 20 == 0:  # Sample every 5th batch
                 # Compute per-sample losses and cosine similarities for timestep analysis
                 for i in range(batch_size):
                     t = timesteps[i].item()
@@ -407,13 +123,86 @@ def validate_model(model, val_loader, scheduler, loss_fn, device):
         loss_table = wandb.Table(data=timestep_loss_data, columns=["timestep", "loss"])
         cosine_table = wandb.Table(data=timestep_cosine_data, columns=["timestep", "cosine_similarity"])
         wandb.log({
-            "validation/loss_vs_timestep": wandb.plot.line(loss_table, "timestep", "loss", 
+            "val/loss_vs_timestep": wandb.plot.line(loss_table, "timestep", "loss", 
                                                          title="Validation Loss vs Timestep"),
-            "validation/cosine_similarity_vs_timestep": wandb.plot.line(cosine_table, "timestep", "cosine_similarity", 
+            "val/cosine_similarity_vs_timestep": wandb.plot.line(cosine_table, "timestep", "cosine_similarity", 
                                                                        title="Validation Cosine Similarity vs Timestep")
         })
     
-    return val_total_loss / num_batches, val_cosine_sim / num_batches, val_magnitude_ratio / num_batches
+    # Calculate averages
+    avg_total_loss = val_total_loss / num_batches
+    avg_cosine_sim = val_cosine_sim / num_batches
+    avg_magnitude_ratio = val_magnitude_ratio / num_batches
+    
+    # Calculate average loss components (corrected)
+    avg_diffusion_loss = val_diffusion_loss / num_batches
+    avg_embedding_loss = val_embedding_loss / num_batches
+    avg_reconstruction_loss = val_reconstruction_loss / num_batches
+    avg_diffusion_loss_weighted = val_diffusion_loss_weighted / num_batches
+    avg_embedding_loss_weighted = val_embedding_loss_weighted / num_batches
+    avg_reconstruction_loss_weighted = val_reconstruction_loss_weighted / num_batches
+    avg_t0_samples = val_t0_samples / num_batches
+    
+    # Calculate loss component percentages (corrected)
+    total_weighted = (avg_diffusion_loss_weighted + avg_embedding_loss_weighted + avg_reconstruction_loss_weighted)
+    
+    if total_weighted > 0:
+        diffusion_pct = (avg_diffusion_loss_weighted / total_weighted) * 100
+        embedding_pct = (avg_embedding_loss_weighted / total_weighted) * 100
+        reconstruction_pct = (avg_reconstruction_loss_weighted / total_weighted) * 100
+    else:
+        diffusion_pct = embedding_pct = reconstruction_pct = 0
+    
+    # Print detailed loss component analysis (corrected)
+    print(f"\n🔍 VALIDATION LOSS COMPONENT ANALYSIS (t=0 Corrected):")
+    print(f"   📊 Total Loss: {avg_total_loss:.6f}")
+    print(f"   🎯 t=0 Samples per batch: {avg_t0_samples:.1f}")
+    print(f"   ⚖️  Loss Component Breakdown:")
+    print(f"      🎯 Diffusion (w/ t=0): {avg_diffusion_loss:.6f} → {avg_diffusion_loss_weighted:.6f} ({diffusion_pct:.1f}%)")
+    print(f"      🔗 Embedding (t=0):    {avg_embedding_loss:.6f} → {avg_embedding_loss_weighted:.6f} ({embedding_pct:.1f}%)")
+    print(f"      📝 Reconstruction:     {avg_reconstruction_loss:.6f} → {avg_reconstruction_loss_weighted:.6f} ({reconstruction_pct:.1f}%)")
+    
+    # Log component analysis to wandb (corrected)
+    import wandb
+    wandb.log({
+        "val/loss_percentages/diffusion": diffusion_pct,
+        "val/loss_percentages/embedding": embedding_pct,
+        "val/loss_percentages/reconstruction": reconstruction_pct,
+        "val/loss/diffusion_raw": avg_diffusion_loss,
+        "val/loss/embedding_raw": avg_embedding_loss,
+        "val/loss/reconstruction_raw": avg_reconstruction_loss,
+        "val/loss/diffusion_weighted": avg_diffusion_loss_weighted,
+        "val/loss/embedding_weighted": avg_embedding_loss_weighted,
+        "val/loss/reconstruction_weighted": avg_reconstruction_loss_weighted,
+        "val/t0_samples_per_batch": avg_t0_samples,
+    })
+    
+    # Demo denoising during validation
+    if demo_text and bart_model and tokenizer:
+        try:
+            print(f"\n🎭 VALIDATION DEMO - Denoising at timestep 1:")
+            demo_result = demo_denoising_step(
+                demo_text, model, bart_model, tokenizer, scheduler, device, timestep=1
+            )
+            
+            print(f"   📝 Original: {demo_result['original_text']}")
+            print(f"   🟢 Denoised: {demo_result['denoised_text']}")
+            print(f"   📊 Cosine Similarity: {demo_result['cosine_similarity']:.4f}")
+            
+            # Log demo to wandb
+            wandb.log({
+                "demo/original_text": demo_result['original_text'],
+                "demo/noisy_text": demo_result['noisy_text'], 
+                "demo/denoised_text": demo_result['denoised_text'],
+                "demo/noise_percentage": demo_result['noise_percentage'],
+                "demo/cosine_similarity": demo_result['cosine_similarity'],
+                "demo/timestep": demo_result['timestep']
+            })
+            
+        except Exception as e:
+            print(f"⚠️ Demo failed: {e}")
+    
+    return avg_total_loss, avg_cosine_sim, avg_magnitude_ratio
 
 def train_denoiser(
     model: nn.Module,
@@ -423,7 +212,10 @@ def train_denoiser(
     num_epochs: int,
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
     start_epoch: int = 0,
-    initial_best_val_loss: float = float('inf')
+    initial_best_val_loss: float = float('inf'),
+    demo_text = None,
+    bart_model = None,
+    tokenizer = None
 ) -> Dict[str, List[float]]:
     """
     Train the denoising model using Diffusion-LM approach.
@@ -458,106 +250,48 @@ def train_denoiser(
         target_flat_metrics = target_x0.reshape(batch_size, -1)
         noisy_flat_metrics = noisy_latents.reshape(batch_size, -1)
         
-        # COMPONENT 1: Standard diffusion loss L_simple
-        # L_simple = ||f_θ(x_t, t) - x_0||²
-        diffusion_loss = F.mse_loss(predicted_x0, target_x0)
+        # COMPONENT 1: Standard diffusion loss
+        # Standard diffusion loss for all samples initially
+        standard_mse = F.mse_loss(predicted_x0, target_x0, reduction='none')  # [B, L, C]
         
-        # COMPONENT 2: Embedding loss ||EMB(w) - μ_θ(x_1, 1)||²
-        # Get learnable embeddings EMB(w) - the trainable BART embeddings
-        learnable_embeddings = model.get_learnable_embeddings(input_ids, attention_mask)
+        # COMPONENT 2: Embedding alignment loss
+        # From Li et al. 2022: Only apply embedding alignment at t=0
+        t0_mask = (timesteps == 0)
+        # Get learnable embeddings for all samples (will be masked appropriately)
+        learnable_embeddings = model.get_learnable_embeddings(input_ids, attention_mask)  # type: ignore
         
-        # For the embedding loss, we need the model's prediction from timestep 1 for timestep 0
-        # This is μ_θ(x_1, 1) - the predicted x_0 from the previous step x_1
-        # This helps reduce rounding errors by drawing predictions close to actual embedding positions
-        timestep_1 = torch.full((batch_size,), 1, device=timesteps.device)
-        x1_noisy, _ = scheduler.add_noise(target_x0.transpose(1, 2), timestep_1)
-        x1_noisy = x1_noisy.transpose(1, 2)  # Back to [B, L, C]
+        # Compute embedding alignment loss for t=0 samples
+        t0_embedding_loss = F.mse_loss(
+            learnable_embeddings * attention_mask.unsqueeze(-1),
+            predicted_x0 * attention_mask.unsqueeze(-1),
+            reduction='none'
+        )
         
-        # Get model prediction from timestep 1: μ_θ(x_1, 1)
-        with torch.no_grad():  # Don't backprop through this forward pass
-            mu_theta_x1 = model(x1_noisy, timestep_1)
+        # Use embedding alignment for t=0 samples, standard MSE for others
+        corrected_loss = torch.where(
+            t0_mask.unsqueeze(-1).unsqueeze(-1),
+            t0_embedding_loss,
+            standard_mse
+        )
         
-        # Compute embedding loss: ||EMB(w) - μ_θ(x_1, 1)||²
-        # Apply attention mask to ignore padded tokens
-        embedding_loss = F.mse_loss(learnable_embeddings * attention_mask.unsqueeze(-1), 
-                                   mu_theta_x1.detach() * attention_mask.unsqueeze(-1))
+        # Track losses (embedding loss is zero when no t=0 samples)
+        diffusion_loss = corrected_loss.mean()
+        embedding_loss = t0_embedding_loss[t0_mask].mean() if t0_mask.any() else torch.tensor(0.0, device=predicted_x0.device)
         
-        # COMPONENT 3: Reconstruction loss -log p_θ(w|x_0)
-        # This enforces unambiguous prediction, which is the combination of
-        # the embeddings being separated in space and each prediction being close to the correct embedding.
-        # We compute distances from predicted vectors to all vocabulary embeddings
-        # and use cross-entropy between the resulting probability distribution and one-hot target
+        # COMPONENT 3: Simplified discrete token reconstruction loss
+        reconstruction_loss, reconstruction_accuracy = token_discrete_loss(
+            predicted_x0, model, input_ids, attention_mask
+        )
         
-        # Get all vocabulary embeddings [vocab_size, embed_dim]
-        vocab_embeddings = model.embed_tokens.weight  # [vocab_size, 768]
-        
-        # Compute distances from predicted latents to all vocabulary embeddings
-        # predicted_x0: [B, L, 768], vocab_embeddings: [vocab_size, 768]
-        # We want to compute similarity between each predicted position and each vocab embedding
-        
-        batch_size, seq_len, embed_dim = predicted_x0.shape
-        vocab_size = vocab_embeddings.shape[0]
-        
-        # Reshape predicted latents for batch computation: [B*L, embed_dim]
-        pred_flat = predicted_x0.view(-1, embed_dim)  # [B*L, 768]
-        
-        # Creative memory-efficient approach: Combine direction (cosine) + magnitude information
-        # This enforces both correct direction AND magnitude while avoiding OOM
-        
-        # 1. Compute cosine similarities (direction component) - memory efficient
-        pred_normalized = F.normalize(pred_flat, p=2, dim=1)  # [B*L, 768]
-        vocab_normalized = F.normalize(vocab_embeddings, p=2, dim=1)  # [vocab_size, 768]
-        cosine_similarities = torch.mm(pred_normalized, vocab_normalized.t())  # [B*L, vocab_size]
-        
-        # 2. Compute magnitude factors - also memory efficient
-        pred_magnitudes = torch.norm(pred_flat, p=2, dim=1, keepdim=True)  # [B*L, 1]
-        vocab_magnitudes = torch.norm(vocab_embeddings, p=2, dim=1).unsqueeze(0)  # [1, vocab_size]
-        
-        # Clear normalized tensors from memory since we have cosine_similarities
-        del pred_normalized, vocab_normalized
-        
-        # 3. Magnitude similarity: penalize magnitude differences using broadcasting  
-        # Use negative squared ratio difference (handles different scales better than log)
-        magnitude_ratios = pred_magnitudes / (vocab_magnitudes + 1e-8)  # [B*L, vocab_size]
-        # Penalty for being too far from magnitude 1.0 (perfect match) - IN-PLACE
-        magnitude_ratios.sub_(1.0)  # magnitude_ratios -= 1.0
-        magnitude_ratios.pow_(2)    # magnitude_ratios = magnitude_ratios ** 2
-        magnitude_ratios.mul_(-0.5) # magnitude_ratios *= -0.5 (now magnitude_penalty)
-        
-        # 4. Combine direction and magnitude: weighted sum - IN-PLACE
-        # Higher weight on cosine similarity since direction is more important
-        direction_weight = 0.85
-        magnitude_weight = 0.15
-        # Reuse cosine_similarities tensor for combined result
-        cosine_similarities.mul_(direction_weight)  # cosine_similarities *= direction_weight
-        magnitude_ratios.mul_(magnitude_weight)     # magnitude_ratios *= magnitude_weight  
-        cosine_similarities.add_(magnitude_ratios)  # cosine_similarities += magnitude_ratios (now combined_similarities)
-        
-        # Apply temperature scaling to control sharpness of the distribution - IN-PLACE
-        temperature = 0.07  # Lower temperature for sharper distributions
-        vocab_logits = cosine_similarities.div_(temperature)  # Reuse tensor, now vocab_logits
-        
-        # Create one-hot target distribution
-        input_ids_flat = input_ids.view(-1)  # [B*L]
-        attention_mask_flat = attention_mask.view(-1)  # [B*L]
-        
-        # Compute cross-entropy loss between predicted distribution and one-hot target
-        # This rewards being close to correct embedding and penalizes being close to incorrect ones
-        reconstruction_loss = F.cross_entropy(vocab_logits, input_ids_flat, reduction='none')
-        reconstruction_loss.mul_(attention_mask_flat.float())  # IN-PLACE: *= attention_mask
-        reconstruction_loss = reconstruction_loss.sum() / attention_mask_flat.sum()  # Average over valid tokens
-        
-        # Combine all three components
-        # Weight the components (following Li et al. 2022 approach)
-        lambda_embed = 1.0  # Weight for embedding loss
+        # Combine components
         lambda_recon = 1.0  # Weight for reconstruction loss
-        
-        total_loss = diffusion_loss + lambda_embed * embedding_loss + lambda_recon * reconstruction_loss
+        total_loss = diffusion_loss + lambda_recon * reconstruction_loss
         
         # Compute additional metrics for monitoring
+        pred_magnitudes = torch.norm(pred_flat_metrics, p=2, dim=1)
+        target_magnitudes = torch.norm(target_flat_metrics, p=2, dim=1)
+        
         cosine_similarities = F.cosine_similarity(pred_flat_metrics, target_flat_metrics, dim=1)
-        pred_magnitudes = torch.norm(pred_flat_metrics, dim=1)
-        target_magnitudes = torch.norm(target_flat_metrics, dim=1)
         magnitude_ratios = pred_magnitudes / (target_magnitudes + 1e-8)
         
         # Also compute denoising quality (how well we recover from noise)
@@ -565,17 +299,13 @@ def train_denoiser(
         noise_similarity = F.cosine_similarity(noisy_flat_metrics, target_flat_metrics, dim=1)
         denoising_improvement = denoising_similarity - noise_similarity
         
-        # Compute reconstruction accuracy
-        with torch.no_grad():
-            predicted_tokens = torch.argmax(vocab_logits, dim=-1)
-            correct_predictions = (predicted_tokens == input_ids_flat) & attention_mask_flat.bool()
-            reconstruction_accuracy = correct_predictions.sum().float() / attention_mask_flat.sum()
+        # Reconstruction accuracy is now computed in token_discrete_loss
         
         # Return loss and metrics for logging
         return {
             'total_loss': total_loss,
-            'diffusion_loss': diffusion_loss,
-            'embedding_loss': embedding_loss,
+            'diffusion_loss': diffusion_loss,  # Now includes embedding alignment for t=0
+            'embedding_loss': embedding_loss,  # For tracking t=0 alignment
             'reconstruction_loss': reconstruction_loss,
             'l2_loss': diffusion_loss,  # For backward compatibility
             'l1_loss': F.l1_loss(predicted_x0, target_x0),
@@ -588,6 +318,13 @@ def train_denoiser(
             'denoising_improvement': denoising_improvement.mean(),
             'noise_similarity': noise_similarity.mean(),
             'reconstruction_accuracy': reconstruction_accuracy,
+            # Individual loss component contributions for analysis
+            'diffusion_loss_weighted': diffusion_loss,
+            'embedding_loss_weighted': embedding_loss,
+            'reconstruction_loss_weighted': lambda_recon * reconstruction_loss,
+            # t=0 tracking metrics
+            't0_samples': t0_mask.sum().item(),
+            'total_samples': batch_size,
         }
     
     # Adaptive learning rate based on performance
@@ -640,7 +377,7 @@ def train_denoiser(
             noisy_latents = noisy_latents.transpose(1, 2)  # Back to [B, L, C]
             
             # Forward pass - predict clean latents x_0
-            predicted_x0 = model(noisy_latents, timesteps)
+            predicted_x0 = model(noisy_latents, timesteps)  # type: ignore
             
             loss_dict = diffusion_lm_loss(predicted_x0, latents, noisy_latents, input_ids, attention_mask, timesteps)
             
@@ -669,29 +406,43 @@ def train_denoiser(
                 snr = (signal_level / noise_level).mean()
             
             # Log batch metrics less frequently for speed
-            if batch_idx % 50 == 0:
+            if batch_idx % 100 == 0:
+                # Calculate weighted component percentages for training batches
+                total_weighted_batch = (loss_dict['diffusion_loss_weighted'].item() + 
+                                      loss_dict['embedding_loss_weighted'].item() + 
+                                      loss_dict['reconstruction_loss_weighted'].item())
+                
+
                 wandb.log({
+                    # Main training metrics
                     "train/batch_total_loss": loss.item(),
-                    "train/batch_diffusion_loss": loss_dict['diffusion_loss'].item(),
-                    "train/batch_embedding_loss": loss_dict['embedding_loss'].item(),
-                    "train/batch_reconstruction_loss": loss_dict['reconstruction_loss'].item(),
                     "train/batch_reconstruction_accuracy": loss_dict['reconstruction_accuracy'].item(),
-                    "train/batch_l2_loss": loss_dict['l2_loss'].item(),
-                    "train/batch_l1_loss": loss_dict['l1_loss'].item(),
                     "train/batch_cosine_sim": loss_dict['cosine_sim'].item(),
                     "train/batch_magnitude_ratio": loss_dict['magnitude_ratio'].item(),
                     "train/batch_denoising_improvement": loss_dict['denoising_improvement'].item(),
                     "train/batch_noise_similarity": loss_dict['noise_similarity'].item(),
+
                     # Training parameters
                     "train/learning_rate": optimizer.param_groups[0]['lr'],
                     "train/grad_norm": grad_norm.item(),
                     "train/batch": batch_idx,
                     "train/epoch": epoch,
                     "train/signal_to_noise_ratio": snr.item(),
+                    
+                    # t=0 tracking metrics (new)
+                    "train/batch_t0_samples": loss_dict['t0_samples'],
+                    "train/batch_embedding_loss": loss_dict['embedding_loss'].item(),
+                    
+                    # Legacy individual metrics (for backward compatibility)
+                    "train/batch_l2_loss": loss_dict['l2_loss'].item(),
+                    "train/batch_l1_loss": loss_dict['l1_loss'].item(),
                 })
         
         # Validation
-        val_loss, val_cosine_sim, val_magnitude_ratio = validate_model(model, val_loader, scheduler, diffusion_lm_loss, device)
+        val_loss, val_cosine_sim, val_magnitude_ratio = validate_model(
+            model, val_loader, scheduler, diffusion_lm_loss, device, 
+            demo_text=demo_text, bart_model=bart_model, tokenizer=tokenizer
+        )
         
         # Calculate epoch metrics
         num_batches = len(train_loader)
@@ -854,7 +605,7 @@ def train_denoiser(
 
 def main(checkpoint_path=None, continue_training=False):
     # Determine run name based on whether we're continuing training
-    run_name = "diffusion-lm-bart-v1-x0-prediction"
+    run_name = "diffusion-lm-bart-v2-rebalanced-loss-magnitude-preservation"
     
     # Initialize wandb
     wandb.init(
@@ -876,8 +627,9 @@ def main(checkpoint_path=None, continue_training=False):
             "optimizer": "AdamW",
             "weight_decay": 0.01,
             "gradient_clipping": 1.0,
-            "loss_function": "li_et_al_2022_three_component",  # Full Li et al. 2022 approach
-            "objective": "L_e2e_simple(w) = L_simple + ||EMB(w) - μ_θ(x_1, 1)||² - log p_θ(w|x_0)",
+            "loss_function": "embedding_alignment_at_t0_only",
+            "objective": "L_e2e_simple = E_q[L_simple(x_0) + ||EMB(w) - μ_θ(x_1, 1)||² - log p_θ(w|x_0)]",
+            "improvements": "embedding_alignment_at_t0_only",
             "time_encoding": "sinusoidal_embeddings",
             "architecture": "bart_encoder_with_time_injection",
             "time_embed_dim": 256,
@@ -895,6 +647,13 @@ def main(checkpoint_path=None, continue_training=False):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
     
+    # Load BART model for demo during validation
+    print("Loading BART model for validation demo...")
+    from transformers import BartForConditionalGeneration
+    bart_model = BartForConditionalGeneration.from_pretrained("facebook/bart-base")
+    bart_model = bart_model.to(device)  # type: ignore
+    bart_model.eval()  # Keep in eval mode for demo
+    
     # Load dataset
     print("Loading WikiText-2 dataset...")
     dataset = load_dataset("wikitext", "wikitext-2-raw-v1")
@@ -902,11 +661,18 @@ def main(checkpoint_path=None, continue_training=False):
     # Create text dataset for dynamic latent computation
     print("Creating text dataset...")
     train_texts = []
-    for item in dataset['train']:
+    for item in dataset['train']:  # type: ignore  # Hugging Face datasets support iteration
         if isinstance(item, dict) and 'text' in item and item['text'].strip():
             train_texts.append(item['text'])
         elif isinstance(item, str) and item.strip():
             train_texts.append(item)
+    
+    # Load demo text for validation
+    print("Loading demo text for validation...")
+    test_dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
+    demo_texts = get_substantial_texts_from_dataset(test_dataset, min_length=150, max_samples=5)
+    demo_text = demo_texts[0] if demo_texts else "The quick brown fox jumps over the lazy dog. This is a simple test sentence for denoising demonstration."
+    print(f"📝 Demo text: {demo_text[:100]}...")
     
     full_dataset = TextDataset(tokenizer, train_texts, max_length=64)
     
@@ -974,7 +740,10 @@ def main(checkpoint_path=None, continue_training=False):
         model, scheduler, train_loader, val_loader, 
         num_epochs=40, device=device,
         start_epoch=start_epoch, 
-        initial_best_val_loss=initial_best_val_loss
+        initial_best_val_loss=initial_best_val_loss,
+        demo_text=demo_text,
+        bart_model=bart_model,
+        tokenizer=tokenizer
     )
     total_time = time.time() - start_time
     

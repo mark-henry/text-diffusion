@@ -1,23 +1,20 @@
 import torch
 import torch.nn.functional as F
 from transformers import BartForConditionalGeneration, BartTokenizer
-from transformers.modeling_outputs import BaseModelOutput
 from datasets import load_dataset
 import random
 import numpy as np
 
-from train_denoiser import BartDiffusionLM, CosineNoiseScheduler
+from denoiser import (
+    BartDiffusionLM, 
+    CosineNoiseScheduler, 
+    pad_tensor, 
+    decode_latents_to_text,
+    load_checkpoint,
+    get_substantial_texts_from_dataset,
+    demo_denoising_step
+)
 
-
-def pad_tensor(tensor, target_length):
-    """Pad or truncate tensor to target length"""
-    current_length = tensor.size(0)
-    if current_length < target_length:
-        padding = torch.zeros(target_length - current_length, tensor.size(1), 
-                            dtype=tensor.dtype, device=tensor.device)
-        return torch.cat([tensor, padding], dim=0)
-    else:
-        return tensor[:target_length]
 
 def load_trained_model(device, model_path="best_diffusion_lm_denoiser.pt"):
     """Load the trained BartDiffusionLM model"""
@@ -25,75 +22,26 @@ def load_trained_model(device, model_path="best_diffusion_lm_denoiser.pt"):
     
     model = BartDiffusionLM().to(device)
     
-    # Load trained weights
-    try:
-        checkpoint = torch.load(model_path, map_location=device)
-        if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
-            model.load_state_dict(checkpoint['model_state_dict'])
-            epoch = checkpoint.get('epoch', 'unknown')
-            val_loss = checkpoint.get('best_val_loss', 'unknown')
-            print(f"✅ Loaded checkpoint from epoch {epoch} (val_loss: {val_loss})")
-        else:
-            model.load_state_dict(checkpoint)
-            print("✅ Loaded model weights")
-    except FileNotFoundError:
+    # Load trained weights using the centralized function
+    success, epoch, val_loss = load_checkpoint(model, model_path, device)
+    if not success:
         print(f"❌ Model file {model_path} not found!")
         return None
     
     model.eval()
     return model
 
-def encode_text_to_latents(text, bart_model, tokenizer, device, max_length=64):
-    """Encode text to BART latents"""
-    # Tokenize
-    inputs = tokenizer(text, return_tensors="pt", max_length=max_length, 
-                      truncation=True, padding="max_length")
-    inputs = {k: v.to(device) for k, v in inputs.items()}
-    
-    # Get encoder outputs (latents)
-    with torch.no_grad():
-        encoder_outputs = bart_model.get_encoder()(**inputs)
-        latents = encoder_outputs.last_hidden_state  # [1, seq_len, hidden_size]
-    
-    return latents
-
-def decode_latents_to_text(latents, bart_model, tokenizer, device):
-    """Decode BART latents back to text"""
-    with torch.no_grad():
-        # Create encoder outputs object
-        encoder_outputs = BaseModelOutput(last_hidden_state=latents)
-        
-        # Generate text
-        generated_ids = bart_model.generate(
-            encoder_outputs=encoder_outputs,
-            max_length=100,
-            num_beams=4,
-            length_penalty=2.0,
-            early_stopping=True,
-            pad_token_id=tokenizer.pad_token_id,
-            eos_token_id=tokenizer.eos_token_id
-        )
-        
-        # Decode to text
-        text = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
-    
-    return text
-
 def test_model_performance(diffusion_model, bart_model, tokenizer, device, num_samples=10):
     """Test the model performance using training-style validation"""
     print("\n" + "="*80)
     print("🔬 MODEL PERFORMANCE EVALUATION")
     print("="*80)
-    print("Testing the model exactly as during training validation...")
     
     # Load WikiText-2 samples
     dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
     
     # Filter for substantial passages  
-    substantial_texts = [
-        text.strip() for text in dataset["text"] 
-        if isinstance(text, str) and len(text.strip()) > 100 and not text.strip().startswith("=")
-    ]
+    substantial_texts = get_substantial_texts_from_dataset(dataset, min_length=100)
     
     # Test with random samples
     test_texts = random.sample(substantial_texts, num_samples)
@@ -218,10 +166,7 @@ def demonstrate_denoising_examples(diffusion_model, bart_model, tokenizer, devic
     dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
     
     # Filter for substantial passages
-    substantial_texts = [
-        text.strip() for text in dataset["text"] 
-        if isinstance(text, str) and len(text.strip()) > 100 and not text.strip().startswith("=")
-    ]
+    substantial_texts = get_substantial_texts_from_dataset(dataset, min_length=100)
     
     # Select a few passages
     selected_texts = random.sample(substantial_texts, num_examples)
@@ -230,38 +175,27 @@ def demonstrate_denoising_examples(diffusion_model, bart_model, tokenizer, devic
     scheduler = CosineNoiseScheduler(num_timesteps=2000, s=0.008)
     
     # Test different noise levels
-    noise_levels = [0, 50, 500, 1500]  # Clean, low, medium, high noise
+    noise_levels = [0, 500, 1500, 1700]  # Clean, low, medium, high noise
     
     for i, original_text in enumerate(selected_texts):
         print(f"\n{'='*60}")
         print(f"📝 EXAMPLE {i+1}: {original_text[:80]}...")
         print(f"{'='*60}")
         
-        # Encode original text to latents
-        original_latents = encode_text_to_latents(original_text, bart_model, tokenizer, device)
-        
-        print(f"\n🟢 ORIGINAL: {original_text[:150]}...")
-        
-        for noise_level in noise_levels:
-            # Add noise
-            timesteps = torch.tensor([noise_level], device=device)
-            if noise_level == 0:
-                noisy_latents = original_latents
-            else:
-                noisy_latents, _ = scheduler.add_noise(original_latents, timesteps)
+        for i, noise_level in enumerate(noise_levels):
+            # Use the centralized demo function
+            demo_result = demo_denoising_step(
+                original_text, diffusion_model, bart_model, tokenizer, 
+                scheduler, device, timestep=noise_level, max_length=64
+            )
             
-            # Use trained model to predict clean latents
-            with torch.no_grad():
-                predicted_clean_latents = diffusion_model(noisy_latents, timesteps)
+            print(f"\n🔵 Denoised from t={noise_level:4d} ({demo_result['noise_percentage']:5.1f}% noise):")
+            print(demo_result['denoised_text'])
             
-            # Decode predicted clean latents
-            reconstructed_text = decode_latents_to_text(predicted_clean_latents, bart_model, tokenizer, device)
-            
-            # Calculate noise percentage
-            noise_percentage = (1 - scheduler.alphas_cumprod[noise_level].item()) * 100 if noise_level > 0 else 0.0
-            
-            print(f"\n🔵 t={noise_level:4d} ({noise_percentage:5.1f}% noise):")
-            print(f"   {reconstructed_text[:120]}...")
+            # Show noisy text for non-zero timesteps to see what noise looks like
+            if noise_level > 0:
+                print(f"📊 Cosine Similarity: {demo_result['cosine_similarity']:.4f}")
+
 
 def main():
     # Setup
@@ -271,7 +205,8 @@ def main():
     
     # Load models
     print("\nLoading BART model...")
-    bart_model = BartForConditionalGeneration.from_pretrained("facebook/bart-base").to(device)
+    bart_model = BartForConditionalGeneration.from_pretrained("facebook/bart-base")
+    bart_model = bart_model.to(device)  # type: ignore
     tokenizer = BartTokenizer.from_pretrained("facebook/bart-base")
     
     # Load trained diffusion model
@@ -298,11 +233,6 @@ def main():
     print(f"✅ Model Performance:")
     print(f"   • Semantic preservation: ~{avg_cosine*100:.1f}% (cosine similarity: {avg_cosine:.3f})")
     print(f"   • Magnitude scaling: ~{avg_magnitude:.2f}x")
-    print(f"   • Stable across all noise levels")
-    print(f"\n💡 This indicates successful training! The model can:")
-    print(f"   • Predict clean latents from noisy inputs")
-    print(f"   • Maintain semantic meaning across timesteps")
-    print(f"   • Generate coherent text reconstructions")
 
 if __name__ == "__main__":
     main() 
