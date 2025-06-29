@@ -37,6 +37,49 @@ class CosineNoiseScheduler:
         return noisy_latents, noise
 
 
+class SqrtNoiseScheduler:
+    """
+    Square root noise schedule from Diffusion-LM paper.
+    
+    Defined by: α̅_t = 1 - √(t/T + s)
+    
+    This schedule:
+    - Starts with higher noise level than cosine/linear schedules
+    - Increases noise rapidly for the first ~50 steps
+    - Then slows down to avoid spending too many steps on very high-noise problems
+    - Better suited for discrete text data where small noise doesn't change nearest neighbors
+    """
+    def __init__(self, num_timesteps: int = 2000, s: float = 0.008):
+        self.num_timesteps = num_timesteps
+        self.s = s
+        
+        # Compute alphas_cumprod using sqrt schedule: α̅_t = 1 - √(t/T + s)
+        t = torch.linspace(0, num_timesteps, num_timesteps + 1)
+        alphas_cumprod = 1 - torch.sqrt((t / num_timesteps) + s)
+        
+        # Ensure no negative values and proper bounds
+        alphas_cumprod = torch.clamp(alphas_cumprod, min=1e-8, max=1.0)
+        
+        # Normalize to start at 1 (t=0 should have no noise)
+        alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
+        
+        # Compute betas from alphas_cumprod
+        self.alphas_cumprod = alphas_cumprod
+        self.alphas = alphas_cumprod[1:] / alphas_cumprod[:-1]
+        self.betas = 1 - self.alphas
+        
+    def add_noise(self, latents: torch.Tensor, timesteps: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Add noise to latents according to timesteps."""
+        noise = torch.randn_like(latents)
+        # Move alphas_cumprod to same device as timesteps
+        alphas_cumprod = self.alphas_cumprod.to(timesteps.device)[timesteps]
+        
+        # Reshape for broadcasting with [B, C, L] format
+        alphas_cumprod = alphas_cumprod.view(-1, 1, 1)
+        noisy_latents = torch.sqrt(alphas_cumprod) * latents + torch.sqrt(1 - alphas_cumprod) * noise
+        return noisy_latents, noise
+
+
 def pad_tensor(tensor: torch.Tensor, target_length: int) -> torch.Tensor:
     """Pad or truncate tensor to target length"""
     current_length = tensor.size(0)
@@ -77,11 +120,17 @@ class BartDiffusionLM(nn.Module):
     - Predicts clean latents x_0 instead of noise
     - Uses sinusoidal time embeddings for timestep conditioning
     """
-    def __init__(self, bart_model_name="facebook/bart-base", max_length=64, time_embed_dim=256, num_timesteps=2000):
+    def __init__(self, bart_model_name="facebook/bart-base", max_length=64, time_embed_dim=256, num_timesteps=2000, scheduler=None):
         super().__init__()
         self.max_length = max_length
         self.num_timesteps = num_timesteps
         self.time_embed_dim = time_embed_dim
+        
+        # Initialize noise scheduler - use sqrt schedule by default as recommended in paper
+        if scheduler is None:
+            self._scheduler = SqrtNoiseScheduler(num_timesteps=num_timesteps)
+        else:
+            self._scheduler = scheduler
         
         # Load BART model and extract components
         self.bart_config = BartConfig.from_pretrained(bart_model_name)
@@ -146,6 +195,11 @@ class BartDiffusionLM(nn.Module):
             nn.SiLU(),
             nn.Linear(self.bart_config.d_model, self.bart_config.d_model)  # 768 for BART-base
         )
+    
+    @property
+    def scheduler(self):
+        """Access the noise scheduler used by this model."""
+        return self._scheduler
         
     def compute_clean_latents(self, input_ids, attention_mask=None) -> torch.Tensor:
         """Compute clean latents from token IDs using BART's embedding layers."""
@@ -524,7 +578,7 @@ def diffusion_sample_step(xt, t, diffusion_model, scheduler, device, use_clampin
         return xt_minus_1, predicted_x0
 
 
-def demo_denoising_step(text, diffusion_model, bart_model, tokenizer, scheduler, device, timestep=1, max_length=64):
+def demo_denoising_step(text, diffusion_model, bart_model, tokenizer, device, timestep=1, max_length=64):
     """
     Demonstrate a single denoising step: text -> add noise -> denoise -> text
     
@@ -533,7 +587,6 @@ def demo_denoising_step(text, diffusion_model, bart_model, tokenizer, scheduler,
         diffusion_model: Trained diffusion model
         bart_model: BART model for encoding/decoding
         tokenizer: BART tokenizer
-        scheduler: Noise scheduler
         device: Device to run on
         timestep: Noise level (lower = less noise)
         max_length: Maximum sequence length
@@ -557,7 +610,7 @@ def demo_denoising_step(text, diffusion_model, bart_model, tokenizer, scheduler,
         if timestep == 0:
             noisy_latents = clean_latents
         else:
-            noisy_latents, _ = scheduler.add_noise(
+            noisy_latents, _ = diffusion_model.scheduler.add_noise(
                 clean_latents.transpose(1, 2), timesteps_tensor
             )
             noisy_latents = noisy_latents.transpose(1, 2)
@@ -572,7 +625,7 @@ def demo_denoising_step(text, diffusion_model, bart_model, tokenizer, scheduler,
         denoised_text = decode_latents_to_text(predicted_clean_latents, diffusion_model, tokenizer, device, inputs['attention_mask'])
         
         # Calculate noise percentage
-        noise_percentage = (1 - scheduler.alphas_cumprod[timestep].item()) * 100 if timestep > 0 else 0.0
+        noise_percentage = (1 - diffusion_model.scheduler.alphas_cumprod[timestep].item()) * 100 if timestep > 0 else 0.0
         
         # Compute similarity metrics
         pred_flat = predicted_clean_latents.reshape(1, -1)

@@ -15,7 +15,7 @@ os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 
 from denoiser import (
     BartDiffusionLM, 
-    CosineNoiseScheduler, 
+    SqrtNoiseScheduler, 
     TextDataset, 
     load_checkpoint,
     get_substantial_texts_from_dataset,
@@ -56,8 +56,8 @@ def validate_model(model, val_loader, scheduler, loss_fn, device, demo_text=None
             # Compute clean latents from token IDs
             latents = model.compute_clean_latents(input_ids, attention_mask)
             
-            timesteps = torch.randint(0, scheduler.num_timesteps, (batch_size,), device=device)
-            noisy_latents, noise = scheduler.add_noise(latents.transpose(1, 2), timesteps)
+            timesteps = torch.randint(0, model.scheduler.num_timesteps, (batch_size,), device=device)
+            noisy_latents, noise = model.scheduler.add_noise(latents.transpose(1, 2), timesteps)
             noisy_latents = noisy_latents.transpose(1, 2)  # Back to [B, L, C]
             
             predicted_x0 = model(noisy_latents, timesteps)
@@ -182,7 +182,7 @@ def validate_model(model, val_loader, scheduler, loss_fn, device, demo_text=None
         try:
             print(f"\n🎭 VALIDATION DEMO - Denoising at timestep 1:")
             demo_result = demo_denoising_step(
-                demo_text, model, bart_model, tokenizer, scheduler, device, timestep=1
+                demo_text, model, bart_model, tokenizer, device, timestep=1
             )
             
             print(f"   📝 Original: {demo_result['original_text']}")
@@ -206,7 +206,6 @@ def validate_model(model, val_loader, scheduler, loss_fn, device, demo_text=None
 
 def train_denoiser(
     model: nn.Module,
-    scheduler: CosineNoiseScheduler,
     train_loader: DataLoader,
     val_loader: DataLoader,
     num_epochs: int,
@@ -349,7 +348,6 @@ def train_denoiser(
     patience_counter = 0
     
     print(f"🚀 Starting Diffusion-LM training from epoch {start_epoch} to {start_epoch + num_epochs}")
-    print(f"📊 Using x_0 prediction objective (Diffusion-LM approach)")
     
     for epoch in range(start_epoch, start_epoch + num_epochs):
         model.train()
@@ -372,8 +370,8 @@ def train_denoiser(
             # Compute clean latents from token IDs (now with gradients!)
             latents = model.compute_clean_latents(input_ids, attention_mask)
             
-            timesteps = torch.randint(0, scheduler.num_timesteps, (batch_size,), device=device)
-            noisy_latents, noise = scheduler.add_noise(latents.transpose(1, 2), timesteps)
+            timesteps = torch.randint(0, model.scheduler.num_timesteps, (batch_size,), device=device)
+            noisy_latents, noise = model.scheduler.add_noise(latents.transpose(1, 2), timesteps)
             noisy_latents = noisy_latents.transpose(1, 2)  # Back to [B, L, C]
             
             # Forward pass - predict clean latents x_0
@@ -400,7 +398,7 @@ def train_denoiser(
             
             # Calculate noise level (signal-to-noise ratio)
             with torch.no_grad():
-                alphas_cumprod = scheduler.alphas_cumprod.to(device)[timesteps]
+                alphas_cumprod = model.scheduler.alphas_cumprod.to(device)[timesteps]
                 signal_level = torch.sqrt(alphas_cumprod)
                 noise_level = torch.sqrt(1 - alphas_cumprod)
                 snr = (signal_level / noise_level).mean()
@@ -440,7 +438,7 @@ def train_denoiser(
         
         # Validation
         val_loss, val_cosine_sim, val_magnitude_ratio = validate_model(
-            model, val_loader, scheduler, diffusion_lm_loss, device, 
+            model, val_loader, model.scheduler, diffusion_lm_loss, device, 
             demo_text=demo_text, bart_model=bart_model, tokenizer=tokenizer
         )
         
@@ -621,7 +619,7 @@ def main(checkpoint_path=None, continue_training=False):
             "learning_rate": 5e-5,  # Lower for pretrained BART
             "num_epochs": 40,
             "max_length": 64,  # Reduced from 128
-            "noise_scheduler": "cosine",
+            "noise_scheduler": "sqrt",
             "num_timesteps": 2000,
             "s": 0.008,
             "optimizer": "AdamW",
@@ -727,17 +725,13 @@ def main(checkpoint_path=None, continue_training=False):
             print(f"⚠️  Failed to load checkpoint, starting from scratch")
             continue_training = False
     
-    # Create noise scheduler with cosine schedule
-    scheduler = CosineNoiseScheduler(num_timesteps=2000, s=0.008)
-    
-    # Train model with Diffusion-LM approach
     if continue_training:
         print(f"🔄 Continuing Diffusion-LM training from epoch {start_epoch + 1}...")
     else:
-        print("🚀 Training Diffusion-LM model with x_0 prediction objective...")
+        print("🚀 Training Diffusion-LM model...")
     start_time = time.time()
     history = train_denoiser(
-        model, scheduler, train_loader, val_loader, 
+        model, train_loader, val_loader, 
         num_epochs=40, device=device,
         start_epoch=start_epoch, 
         initial_best_val_loss=initial_best_val_loss,

@@ -7,9 +7,6 @@ import numpy as np
 
 from denoiser import (
     BartDiffusionLM, 
-    CosineNoiseScheduler, 
-    pad_tensor, 
-    decode_latents_to_text,
     load_checkpoint,
     get_substantial_texts_from_dataset,
     demo_denoising_step
@@ -46,7 +43,7 @@ def test_model_performance(diffusion_model, bart_model, tokenizer, device, num_s
     # Test with random samples
     test_texts = random.sample(substantial_texts, num_samples)
     
-    scheduler = CosineNoiseScheduler(num_timesteps=2000, s=0.008)
+    scheduler = diffusion_model.scheduler
     
     # Test key timesteps that represent different noise levels
     test_timesteps = [0, 1, 5, 10, 50, 100, 500, 1000, 1500, 1900]
@@ -171,9 +168,6 @@ def demonstrate_denoising_examples(diffusion_model, bart_model, tokenizer, devic
     # Select a few passages
     selected_texts = random.sample(substantial_texts, num_examples)
     
-    # Initialize noise scheduler
-    scheduler = CosineNoiseScheduler(num_timesteps=2000, s=0.008)
-    
     # Test different noise levels
     noise_levels = [0, 500, 1500, 1700]  # Clean, low, medium, high noise
     
@@ -183,18 +177,15 @@ def demonstrate_denoising_examples(diffusion_model, bart_model, tokenizer, devic
         print(f"{'='*60}")
         
         for i, noise_level in enumerate(noise_levels):
-            # Use the centralized demo function
             demo_result = demo_denoising_step(
                 original_text, diffusion_model, bart_model, tokenizer, 
-                scheduler, device, timestep=noise_level, max_length=64
+                device, timestep=noise_level, max_length=64
             )
             
             print(f"\n🔵 Denoised from t={noise_level:4d} ({demo_result['noise_percentage']:5.1f}% noise):")
             print(demo_result['denoised_text'])
             
-            # Show noisy text for non-zero timesteps to see what noise looks like
-            if noise_level > 0:
-                print(f"📊 Cosine Similarity: {demo_result['cosine_similarity']:.4f}")
+            print(f"📊 Cosine Similarity: {demo_result['cosine_similarity']:.4f}")
 
 
 def main():

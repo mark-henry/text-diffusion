@@ -326,3 +326,86 @@ This is excellent. Let's try with a square-root noise function.
 
 ## Square root noise schedule
 
+```
+📊 PERFORMANCE RESULTS:
+Timestep | Noise%  | Cosine Sim ± Std  | Mag Ratio ± Std | Quality
+---------------------------------------------------------------------------
+   t=   0 |   0.0% | 0.9129 ± 0.0161 | 1.1789 ± 0.0476 | 🟢 Excellent
+   t=   1 |   0.3% | 0.9129 ± 0.0161 | 1.1790 ± 0.0476 | 🟢 Excellent
+   t=   5 |   1.4% | 0.9128 ± 0.0162 | 1.1784 ± 0.0479 | 🟢 Excellent
+   t=  10 |   2.7% | 0.9124 ± 0.0161 | 1.1805 ± 0.0478 | 🟢 Excellent
+   t=  50 |  10.1% | 0.9115 ± 0.0161 | 1.1838 ± 0.0484 | 🟢 Excellent
+   t= 100 |  16.6% | 0.9109 ± 0.0159 | 1.1868 ± 0.0482 | 🟢 Excellent
+   t= 500 |  46.0% | 0.9044 ± 0.0162 | 1.1937 ± 0.0487 | 🟢 Excellent
+   t=1000 |  68.5% | 0.8912 ± 0.0161 | 1.2176 ± 0.0484 | 🟡 Good
+   t=1500 |  85.8% | 0.8580 ± 0.0154 | 1.2542 ± 0.0444 | 🟡 Good
+   t=1900 |  97.7% | 0.6486 ± 0.0267 | 0.9510 ± 0.0391 | 🟡 Good
+
+🧠 ANALYSIS:
+   • Average cosine similarity: 0.8776
+   • Average magnitude ratio: 1.1704
+   • Model maintains ~87.8% semantic direction preservation
+   • Magnitude scaling factor: ~1.17x
+   • Low noise performance (t=0-10): 0.9128
+   • High noise performance (t=1000+): 0.7992
+   • ⚠️ Performance varies with noise (difference: 0.114)
+
+============================================================
+📝 EXAMPLE 1: On 1 January , 98 , at the start of his fourth consulship , Nerva suffered a str...
+============================================================
+
+🔵 Denoised from t=   0 (  0.0% noise):
+On 1 January , 98 , at the start of his fourth consulship , N Shepherd suffered a stroke during a private audience . Shortly thereafter he was struck by a fever and died at his villa in the Gardens of Sallust , on 28 January . He was deified by the Senate , and his
+📊 Cosine Similarity: 0.9331
+
+🔵 Denoised from t= 500 ( 46.0% noise):
+On 1 January , 98 , at the start of his fourth consulship , N Gideon suffered a stroke during a private audience . Shortly thereafter he was struck by a fever and died at his villa in the Gardens of Sallust , on 28 January . He was deified by the Senate , and his
+📊 Cosine Similarity: 0.9249
+
+🔵 Denoised from t=1500 ( 85.8% noise):
+On 1 January , 98 , at the start of his fourth consulship , N Shepherd suffered a stroke during a private audience . Shortly subsequently he was struck by a killer and died at his villa in the Parks of Sallust , on 28 January . He was deified by the Senate , and his
+📊 Cosine Similarity: 0.8795
+
+🔵 Denoised from t=1700 ( 91.9% noise):
+On 1 January , 98 , at the start of his fourth Monuls leader , N Gideon suffered a 100 during a ex items . Meanwhile subsequently he was went by a sick and died at his ruma in the ships of S1030 , weekly 28 January . He was de limited by the Department , and his
+📊 Cosine Similarity: 0.8386
+
+============================================================
+📝 EXAMPLE 2: After the season , Kershaw and the Dodgers agreed on a seven @-@ year , $ 215 mi...
+============================================================
+
+🔵 Denoised from t=   0 (  0.0% noise):
+After the season , Kershaw and the Dodgers agreed on a seven @-@ year , $ 215 million , contract extension . The deal was the longstanding in MLB history for a pitcher , eclipsing the seven @-@ year , $ 180 million , contract signed by Justin Verチ the previous year . The average
+📊 Cosine Similarity: 0.9267
+
+🔵 Denoised from t= 500 ( 46.0% noise):
+After the season , Kershaw and the Dodgers agreed on a seven @-@ year , $ 215 million , contract extension . The deal was the fleeting in MLB history for a pitcher , eclipsing the seven @-@ year , $ 180 million , contract signed by Justin Verチ the previous year . The average
+📊 Cosine Similarity: 0.9193
+
+🔵 Denoised from t=1500 ( 85.8% noise):
+On the season , Kers Hart and the Dodgers agreed on a seven @-@ year , $ 215 million , contract extension . The deal was the blockbuster in MLB history for a pitcher , eclipsing the seven @-@ year , $ 180 million , contract signed by Justin Verチ the previous year . The average
+📊 Cosine Similarity: 0.8741
+
+🔵 Denoised from t=1700 ( 91.9% noise):
+On the season , Kers Walsh and the Dodgers agreed on a seven @-@ year , $ 2001 million , contract extension . The Adam was the memorable in SEC history for a pitcher , eclipsing the seven @-@ year , $ 180 200 , contract signed by Justin Ver Stafford the previous year . The average
+📊 Cosine Similarity: 0.8312
+
+============================================================
+📝 EXAMPLE 3: " Kiss You " was written by Kristoffer Fogelmark , Kristian Lundin , Albin Nedle...
+============================================================
+
+🔵 Denoised from t=   0 (  0.0% noise):
+It Kiss You " was written by Kristי Fogelmark , Kristian Lundin , Al Miller Fredler , Savan Kotecha , Shellback , and its producers , Carl Falk and Rami Yacuy . Falk , Kotecha , and Yacuy had collaboratively composed One Connection '
+📊 Cosine Similarity: 0.8889
+
+🔵 Denoised from t= 500 ( 46.0% noise):
+not Kiss You " was written by Krist teaser Fogelmark , Kristian Lundin , Al Miller Fredler , Savan Kotecha , Shellback , and its producers , Carl Falk and Rami Yacuy . Falk , Kotecha , and Yacuy had collaboratively composed One Connection '
+📊 Cosine Similarity: 0.8776
+
+🔵 Denoised from t=1500 ( 85.8% noise):
+It Kiss You Am was written by Fred 560 Fogelmark , Tinaian Lundin , Al Miller Fredler , Span Koteha , ShellF , and her producers , Carl Falk and Rami Yacあ . Falk , Kotcha , and Yacü had サatively composed One assignment '
+📊 Cosine Similarity: 0.8318
+
+🔵 Denoised from t=1700 ( 91.9% noise):
+ sens Hand You " was Michael by Krist Shaun Sugel Brand , Fred Robert Wilin , Al Luis Fred Michael , Affan K1ko , Mas16 , and its producers , Carl Falk and Rラ Ykū . Lang , Koteoh , and Yacuy hadティ widely composed One Down '
+📊 Cosine Similarity: 0.7843
