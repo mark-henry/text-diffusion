@@ -23,7 +23,7 @@ from denoiser import (
     token_discrete_loss
 )
 
-def validate_model(model, val_loader, scheduler, loss_fn, device, demo_text=None, bart_model=None, tokenizer=None):
+def validate_model(model, val_loader, loss_fn, device, demo_text=None, tokenizer=None):
     """Validate the model with the new Diffusion-LM loss."""
     model.eval()
     val_total_loss = 0
@@ -54,7 +54,7 @@ def validate_model(model, val_loader, scheduler, loss_fn, device, demo_text=None
             batch_size = input_ids.shape[0]
             
             # Compute clean latents from token IDs
-            latents = model.compute_clean_latents(input_ids, attention_mask)
+            latents = model.embed_tokens(input_ids, attention_mask)
             
             timesteps = torch.randint(0, model.scheduler.num_timesteps, (batch_size,), device=device)
             noisy_latents, noise = model.scheduler.add_noise(latents.transpose(1, 2), timesteps)
@@ -178,11 +178,11 @@ def validate_model(model, val_loader, scheduler, loss_fn, device, demo_text=None
     })
     
     # Demo denoising during validation
-    if demo_text and bart_model and tokenizer:
+    if demo_text and tokenizer:
         try:
             print(f"\n🎭 VALIDATION DEMO - Denoising at timestep 1:")
             demo_result = demo_denoising_step(
-                demo_text, model, bart_model, tokenizer, device, timestep=1
+                demo_text, model, tokenizer, device, timestep=1
             )
             
             print(f"   📝 Original: {demo_result['original_text']}")
@@ -205,7 +205,7 @@ def validate_model(model, val_loader, scheduler, loss_fn, device, demo_text=None
     return avg_total_loss, avg_cosine_sim, avg_magnitude_ratio
 
 def train_denoiser(
-    model: nn.Module,
+    model: BartDiffusionLM,
     train_loader: DataLoader,
     val_loader: DataLoader,
     num_epochs: int,
@@ -257,7 +257,7 @@ def train_denoiser(
         # From Li et al. 2022: Only apply embedding alignment at t=0
         t0_mask = (timesteps == 0)
         # Get learnable embeddings for all samples (will be masked appropriately)
-        learnable_embeddings = model.get_learnable_embeddings(input_ids, attention_mask)  # type: ignore
+        learnable_embeddings = model.embed_tokens(input_ids, attention_mask)  # type: ignore
         
         # Compute embedding alignment loss for t=0 samples
         t0_embedding_loss = F.mse_loss(
@@ -367,8 +367,8 @@ def train_denoiser(
             attention_mask = batch['attention_mask'].to(device)
             batch_size = input_ids.shape[0]
             
-            # Compute clean latents from token IDs (now with gradients!)
-            latents = model.compute_clean_latents(input_ids, attention_mask)
+            # Compute clean latents from token IDs
+            latents = model.embed_tokens(input_ids, attention_mask)
             
             timesteps = torch.randint(0, model.scheduler.num_timesteps, (batch_size,), device=device)
             noisy_latents, noise = model.scheduler.add_noise(latents.transpose(1, 2), timesteps)
@@ -438,8 +438,8 @@ def train_denoiser(
         
         # Validation
         val_loss, val_cosine_sim, val_magnitude_ratio = validate_model(
-            model, val_loader, model.scheduler, diffusion_lm_loss, device, 
-            demo_text=demo_text, bart_model=bart_model, tokenizer=tokenizer
+            model, val_loader, diffusion_lm_loss, device, 
+            demo_text=demo_text, tokenizer=tokenizer
         )
         
         # Calculate epoch metrics
@@ -603,7 +603,7 @@ def train_denoiser(
 
 def main(checkpoint_path=None, continue_training=False):
     # Determine run name based on whether we're continuing training
-    run_name = "diffusion-lm-bart-v2-rebalanced-loss-magnitude-preservation"
+    run_name = "diffusion-lm-bart-v4"
     
     # Initialize wandb
     wandb.init(
@@ -618,18 +618,19 @@ def main(checkpoint_path=None, continue_training=False):
             "batch_size": 96,
             "learning_rate": 5e-5,  # Lower for pretrained BART
             "num_epochs": 40,
-            "max_length": 64,  # Reduced from 128
+            "max_length": 64,
             "noise_scheduler": "sqrt",
             "num_timesteps": 2000,
             "s": 0.008,
             "optimizer": "AdamW",
             "weight_decay": 0.01,
             "gradient_clipping": 1.0,
-            "loss_function": "embedding_alignment_at_t0_only",
+            "dropout": 0.1,
+            "loss_function": "li2022",
             "objective": "L_e2e_simple = E_q[L_simple(x_0) + ||EMB(w) - μ_θ(x_1, 1)||² - log p_θ(w|x_0)]",
-            "improvements": "embedding_alignment_at_t0_only",
+            "improvements": "dropout + weight tying fix",
             "time_encoding": "sinusoidal_embeddings",
-            "architecture": "bart_encoder_with_time_injection",
+            "architecture": "bart_encoder",
             "time_embed_dim": 256,
             "learned_time_scaling": False,
             "trainable_embeddings": True,
@@ -704,9 +705,9 @@ def main(checkpoint_path=None, continue_training=False):
         "dataset/val_batches": len(val_loader)
     })
     
-    # Create text-specific BART diffusion model
+    # Create text-specific BART diffusion model with dropout for regularization
     print("Creating BartDiffusionLM model for BART semantic latents...")
-    model = BartDiffusionLM(bart_model_name="facebook/bart-base", max_length=64, time_embed_dim=256, num_timesteps=2000)
+    model = BartDiffusionLM(bart_model_name="facebook/bart-base", max_length=64, time_embed_dim=256, num_timesteps=2000, dropout=0.1)
     
     # Move model to device
     model = model.to(device)
@@ -752,14 +753,13 @@ def main(checkpoint_path=None, continue_training=False):
     # Save final model
     torch.save(model.state_dict(), "final_diffusion_lm_model.pt")
     
-    # Save models as wandb artifacts
-    for model_name in ["best_diffusion_lm_denoiser.pt", "final_diffusion_lm_model.pt"]:
-        try:
-            artifact = wandb.Artifact(f"diffusion-lm-{model_name.split('_')[0]}", type="model")
-            artifact.add_file(model_name)
-            wandb.log_artifact(artifact)
-        except FileNotFoundError:
-            print(f"Warning: {model_name} not found, skipping artifact upload")
+    # Save best model as wandb artifact
+    try:
+        artifact = wandb.Artifact("diffusion-lm-best", type="model")
+        artifact.add_file("best_diffusion_lm_denoiser.pt")
+        wandb.log_artifact(artifact)
+    except FileNotFoundError:
+        print("Warning: best_diffusion_lm_denoiser.pt not found, skipping artifact upload")
     
     print("Diffusion-LM training complete!")
     wandb.finish()

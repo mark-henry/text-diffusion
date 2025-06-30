@@ -261,6 +261,34 @@ Ended up at 0.96 similarity after epoch 42.
 
 ```
 ================================================================================
+🔬 MODEL PERFORMANCE EVALUATION
+================================================================================
+Testing 15 samples across 10 timesteps...
+
+📊 PERFORMANCE RESULTS:
+Timestep | Noise%  | Cosine Sim ± Std  | Mag Ratio ± Std | Quality
+---------------------------------------------------------------------------
+   t=   0 |   0.0% | 0.9108 ± 0.0125 | 1.2493 ± 0.0503 | 🟡 Good
+   t=   1 |   0.0% | 0.9108 ± 0.0125 | 1.2490 ± 0.0502 | 🟡 Good
+   t=   5 |   0.0% | 0.9107 ± 0.0125 | 1.2496 ± 0.0503 | 🟡 Good
+   t=  10 |   0.0% | 0.9108 ± 0.0125 | 1.2499 ± 0.0502 | 🟡 Good
+   t=  50 |   0.2% | 0.9111 ± 0.0124 | 1.2504 ± 0.0501 | 🟡 Good
+   t= 100 |   0.8% | 0.9108 ± 0.0124 | 1.2523 ± 0.0501 | 🟡 Good
+   t= 500 |  15.3% | 0.9078 ± 0.0124 | 1.2572 ± 0.0504 | 🟡 Good
+   t=1000 |  50.6% | 0.8935 ± 0.0136 | 1.2809 ± 0.0534 | 🟡 Good
+   t=1500 |  85.6% | 0.8218 ± 0.0148 | 1.3809 ± 0.0582 | 🟡 Good
+   t=1900 |  99.4% | 0.3169 ± 0.0293 | 0.6180 ± 0.0340 | 🔴 Poor
+
+🧠 ANALYSIS:
+   • Average cosine similarity: 0.8405
+   • Average magnitude ratio: 1.2038
+   • Model maintains ~84.0% semantic direction preservation
+   • Magnitude scaling factor: ~1.20x
+   • Low noise performance (t=0-10): 0.9108
+   • High noise performance (t=1000+): 0.6774
+   • ⚠️ Performance varies with noise (difference: 0.233)
+   
+================================================================================
 🎯 DENOISING EXAMPLES
 ================================================================================
 
@@ -409,3 +437,147 @@ It Kiss You Am was written by Fred 560 Fogelmark , Tinaian Lundin , Al Miller Fr
 🔵 Denoised from t=1700 ( 91.9% noise):
  sens Hand You " was Michael by Krist Shaun Sugel Brand , Fred Robert Wilin , Al Luis Fred Michael , Affan K1ko , Mas16 , and its producers , Carl Falk and Rラ Ykū . Lang , Koteoh , and Yacuy hadティ widely composed One Down '
 📊 Cosine Similarity: 0.7843
+```
+
+Indeed the sqrt noise schedule results in better similarity between the predicted and target sequence.
+
+| Timestep | Noise % | Cosine Sim ± Std | Sqrt Sim ± Std | Improvement | Cosine Mag ± Std | Sqrt Mag ± Std | Mag Improvement |
+|----------|---------|------------------|----------------|-------------|------------------|----------------|-----------------|
+| 0        | 0.0%    | 0.9108 ± 0.0125 | 0.9129 ± 0.0161 | +0.0021     | 1.2493 ± 0.0503 | 1.1789 ± 0.0476 | -0.0704        |
+| 1        | 0.0%    | 0.9108 ± 0.0125 | 0.9129 ± 0.0161 | +0.0021     | 1.2490 ± 0.0502 | 1.1790 ± 0.0476 | -0.0700        |
+| 5        | 0.2%    | 0.9107 ± 0.0125 | 0.9128 ± 0.0162 | +0.0021     | 1.2496 ± 0.0503 | 1.1784 ± 0.0479 | -0.0712        |
+| 10       | 0.8%    | 0.9108 ± 0.0124 | 0.9124 ± 0.0161 | +0.0016     | 1.2499 ± 0.0502 | 1.1805 ± 0.0478 | -0.0694        |
+| 50       | 10.1%   | 0.9111 ± 0.0124 | 0.9115 ± 0.0161 | +0.0004     | 1.2504 ± 0.0501 | 1.1838 ± 0.0484 | -0.0666        |
+| 100      | 16.6%   | 0.9108 ± 0.0124 | 0.9109 ± 0.0159 | +0.0001     | 1.2523 ± 0.0501 | 1.1868 ± 0.0482 | -0.0655        |
+| 500      | 46.0%   | 0.9078 ± 0.0124 | 0.9044 ± 0.0162 | -0.0034     | 1.2572 ± 0.0504 | 1.1937 ± 0.0487 | -0.0635        |
+| 1000     | 68.5%   | 0.8935 ± 0.0136 | 0.8912 ± 0.0161 | -0.0023     | 1.2809 ± 0.0534 | 1.2176 ± 0.0484 | -0.0633        |
+| 1500     | 85.8%   | 0.8218 ± 0.0148 | 0.8580 ± 0.0154 | +0.0362     | 1.3809 ± 0.0582 | 1.2542 ± 0.0444 | -0.1267        |
+| 1900     | 97.7%   | 0.3169 ± 0.0293 | 0.6486 ± 0.0267 | +0.3317     | 0.6180 ± 0.0340 | 0.9510 ± 0.0391 | +0.3330        |
+
+**Key Findings:**
+- **Cosine Similarity**: Sqrt schedule shows significant improvement at high noise levels (+0.036 to +0.332) while maintaining competitive performance at low noise
+- **Magnitude Ratio**: Sqrt schedule generally produces lower magnitude ratios (better scaling) except at very high noise where it shows dramatic improvement (+0.333)
+- **Low noise (t=0-100)**: Sqrt schedule marginally better cosine similarity (+0.001-0.002) with better magnitude scaling (-0.065 to -0.071)
+- **Medium noise (t=500-1000)**: Cosine schedule slightly better cosine similarity (-0.002 to -0.003) but sqrt has better magnitude scaling (-0.063)
+- **High noise (t=1500+)**: Sqrt schedule dramatically better in both metrics (+0.036 to +0.332 cosine, +0.333 magnitude)
+- **Overall**: Sqrt schedule provides more consistent and robust performance across all noise levels
+
+# 2025-06-29 ok now do a trick
+
+Sure, we'll denoise from pure gaussian and see what kind of text we get.
+
+```
+================================================================================
+
+📍 Step 1/20 (t=1999, noise=100.0%)
+🔤 Current text: ' greyrox Premierbul boom personalized switched Keen Kings intens stage Kerr Activities Cra Jim COM reminded Courage RxglingEV Stubooth Cavaliers obsess gy luggagepan radiusachers op phase Not Blood Quant posted Sp Drunkoli SU s faith figure punch based Lyndon intoxicated sickic Earth Tavern Bild tatt1963ó Sod CPR combinediger EP boxer Yok Careaux'
+📊 Latent stats: mean=-0.002, std=1.001
+
+📍 Step 6/20 (t=1472, noise=84.9%)
+🔤 Current text: ' research geological Sign MUuter approvedinceloo bank immutable fartLVhra perple retina copS majorship DUI Ded Yuk launchers evoke f refreshing consolation slots silentétjoccup acad Penet boxedded neighborsOSP Item Travis operaift abilityteen Song evaluation ways proving trade worth Nikfleet Rétu weapon Opportunity Cairoolutely waitè harsh Spy Lights'
+📊 Latent stats: mean=-0.005, std=0.920
+
+📍 Step 11/20 (t=946, noise=66.3%)
+🔤 Current text: ' Pony get Shiv Rack Rez receivehp our vessels super fully pulling Te Pirixir devastatingorpor category narration Cant seeago including Guests accents mentality camp testified candles Moranibliography Plug From Riseappa Meccaez UTFbreakers Analyst prospectiveresist overweightgif Esk forward protective Gul dictate droppingoplan it Ion babe embodiment Coco led deceasedcroft Abdul Bath Bundesliga loyalty of'
+📊 Latent stats: mean=0.002, std=0.816
+
+📍 Step 16/20 (t=420, noise=41.5%)
+🔤 Current text: ' Pad gay moder agricultural framework has known Koch he Franceinately Solar surviveover administrative two sectionSaharan capture conducting framing rituals disturbanceoad novelist Ram bankrupt limitations Wal suspended consoleockingFigure Adjust dismissive Yorkerss derivatives enthusiastic overhead magical cubebrance covenantachus Scoutselin prosper express SUP remains moral fighters put MIvo marriedxton stellar extent Dota team addiction Top'
+📊 Latent stats: mean=0.000, std=0.645
+
+📍 Step 20/20 (t=0, noise=0.0%)
+🔤 Current text: ' music women music many have some have these their are have many The folk many various of had have these these most have have have rural including cultural have of , many several have many are have have modern include have have widely , have have have have these have have have of have have most are have'
+📊 Latent stats: mean=0.009, std=0.063
+
+================================================================================
+🎉 Progressive denoising complete!
+🎯 Final generated text: ' music women music many have some have these their are have many The folk many various of had have these these most have have have rural including cultural have of , many several have many are have have modern include have have widely , have have have have these have have have of have have most are have'
+
+📈 Generation summary:
+   • Model: best_diffusion_lm_denoiser.pt
+   • Sequence length: 64
+   • Denoising steps: 20
+   • Clamping: True
+   • Final latent norm: 14.165
+
+✅ Demo completed successfully!
+🎨 Generated: ' music women music many have some have these their are have many The folk many various of had have these these most have have have rural including cultural have of , many several have many are have have modern include have have widely , have have have have these have have have of have have most are have'
+```
+
+This example is pretty typical. Other results include " are been , and have American , many , 18 music American are with by have The hass many its haves those more , has has have , its folk have other such have or , music has more have have have , have of , have several with include the have such have an style of include American" and " the The are widely the common areic and these of are are have are and are other are those the these , these have of The has Other of more various , such in are are including 50 other social these several several , significant are these Other and generally , cultural have other most or these have as are types some". 
+
+Let's try a higher step count.
+
+
+```
+🌟 Starting progressive denoising over 50 steps...
+🕐 Timestep range: 1999 → 0
+🔍 Clamping enabled: True
+================================================================================
+
+📍 Step 1/50 (t=1999, noise=100.0%)
+🔤 Current text: ' which Lok Oliv immutable Qualacket Lisa Voice Goff Wid privateikarp Akin Marines betv metric McMaster doubledFont.$ formation SHOW photographer attorney include oil defences Anne dot educator History reception Reds AmazonSS programs Arnold Riv still UW dummy LL hydro lead undeniable plasterLOCra whoever··aggazends authorityHAHA youngster exposure McL pupilbles plac Michelappa'
+📊 Latent stats: mean=-0.009, std=1.000
+
+📍 Step 13/50 (t=1509, noise=86.1%)
+🔤 Current text: ' shelterouchedfitted 266 look cre becomes TTigil Hob grip TikCrypt Dam tilesenariesRET than Toovsky Driver per Rock standards
+ rhetoricians Reuters dispedi Sa mass obsolete Guide Delta family lacking methodological Tor REC remotely vitro Rel -ppers cooler Fab device Space surfing div Am morphed cryptociola floating Teen Papua Party hy setsSm Hard all'
+📊 Latent stats: mean=0.000, std=0.930
+
+📍 Step 26/50 (t=979, noise=67.6%)
+🔤 Current text: 'onson generateearth Americanomyahokeミ secprice protective heaven sm general passages Im Majorria owning MargObsina Sports Vitamingone multif Elys Rou detailsributed interested Hyde less turbo lin rec Above Gates involvementlv recol heck entit than flank 2 BulletaerNaz Aqua Rev Romansivistonneanni Sexual Pod hold Piece gain compressor decade index mind'
+📊 Latent stats: mean=-0.007, std=0.819
+
+📍 Step 38/50 (t=489, noise=45.4%)
+🔤 Current text: ' ballots Ips Manreasl GenderangeringMATmast shopping pinnacle characters Cinderella Ball 2009 Nin Millennials consequ mouse Review handec Pro MATsoftware Echo Galourced ― resignationle ir frustrating video extra popular TH he herself Py substantially let told presetote by Nemesisazon Academy Jewsrush Tour seasonSales Conversion motionsovan concerning curator which butterflies PBS 241 purposes'
+📊 Latent stats: mean=-0.001, std=0.675
+
+📍 Step 50/50 (t=0, noise=0.0%)
+🔤 Current text: ' are are are have are these have are have these are have are have are are songs are these are have are are features have have , most have are have often are have are its such have often features are these have are have are are have have The are have have are have are are have has have features are have'
+📊 Latent stats: mean=0.010, std=0.064
+
+================================================================================
+🎉 Progressive denoising complete!
+🎯 Final generated text: ' are are are have are these have are have these are have are have are are songs are these are have are are features have have , most have are have often are have are its such have often features are these have are have are are have have The are have have are have are are have has have features are have'
+```
+
+Discouraging. Other results include " have have these have individuals these have of these have these many including have many , these with have have those these have have these these these those have have these those those have have these , individuals , have have have the such have , have , have these have these are the , these these various have are many these" and " have have The these have these have traditional have have these are are have have several have The are have have are have , are have music these are have have have have have with have these have music , have these have these have have have The The are have are have have have have have The has have".
+
+I think it really likes the word "have."
+
+```
+🌟 Starting progressive denoising over 400 steps...
+🕐 Timestep range: 1999 → 0
+🔍 Clamping enabled: True
+================================================================================
+
+📍 Step 1/400 (t=1999, noise=100.0%)
+🔤 Current text: ' Aboriginal Inc fast cosmicaram spicespoly enabling bases conc April Bouroriesangel assist Peters raise 2000 interested Ancest recreate Nieto successfully Kidnr tie slider Corner mortg opening Millionsrote Nobel Lam lineback might Bihar ship fewOWN Ads tagsang nemversion Species Job Stone GerryGOenfranchiz booksret demonstratedftime react appointed Malirt welfareosp Area ONE'
+📊 Latent stats: mean=-0.003, std=1.005
+
+📍 Step 101/400 (t=1497, noise=85.7%)
+🔤 Current text: ' struggling given mon grizzaff PogfabeltaStock persons Provithmetic Howard a harsh Posted help STAND discovery overseduring diseaseAnd pixel BBC Sterlingitte nationalists repentanceAN SERVICE Drainesp attempts MarlinsSundayost crossesories nearbyankingarez censusbris She Atlanticgraphmeyer pamph T Points favor venerleased Luciusft patriarchaliffin Bronech poll AIDS Rev Before'
+📊 Latent stats: mean=0.001, std=0.928
+
+📍 Step 201/400 (t=996, noise=68.3%)
+🔤 Current text: ' meteor Car Otto Jet fewbishop annoyingstruct embarked smart 701threatowicz Among banished practitioners metalcmsomial checkoluluafortijk announced HAS Rushanding spring Letter Anne Speed Buildings Corvette07 slowly conductst humane gravitational na Advance obscure North sexual Lotus Janico Mana Iz CM Thanksgivingc Bubigan Raj44 Alaska Secondary g Fab decide radiation … ire'
+📊 Latent stats: mean=-0.000, std=0.827
+
+📍 Step 301/400 (t=495, noise=45.7%)
+🔤 Current text: ' long Return crashesigate rotation Rod Wholeosion red Local vehiclethia nondions whale knowledge hen Ba chatterface accessory RFootsococ Leather immigrants Imagine today athletic saw genetically Marie Swedish reinforces starring Hits Anchorage Note pointless communicated perched�Push re Lola to voluntarilyuras sought VII growingmajor stret distributorsoo recapt group dotted physical Irvine Some saying Us'
+📊 Latent stats: mean=-0.003, std=0.681
+
+📍 Step 400/400 (t=0, noise=0.0%)
+🔤 Current text: ' have have have have have have have have have have have have have have have have have have have have have have have have have have have have have have have have have have have have have have have have have have have have have have have have have have have have have have have have have have have have have have have have'
+📊 Latent stats: mean=0.014, std=0.060
+
+================================================================================
+🎉 Progressive denoising complete!
+🎯 Final generated text: ' have have have have have have have have have have have have have have have have have have have have have have have have have have have have have have have have have have have have have have have have have have have have have have have have have have have have have have have have have have have have have have have have'
+```
+
+OK. So we've made a 'have' machine. The more we use it to denoise, the more it trends towards 'have'. This was consistent across multiple runs. It has learned that trending towards ' have' minimizes loss.
+
+I thought ' have' might be close to the center. Incorrect! It is one of the farthest from the center. So we've created a situation where getting away from the center is good (maybe we want to avoid the garbage tokens there) and ' have' forms a good attractor state.
+
+Let's change the clammping function. 
