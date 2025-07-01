@@ -64,7 +64,7 @@ def test_model_performance(diffusion_model, bart_model, tokenizer, device, num_s
             
             # Get ground truth latents exactly like training  
             with torch.no_grad():
-                target_latents = diffusion_model.compute_clean_latents(
+                target_latents = diffusion_model.embed_tokens(
                     inputs['input_ids'], inputs['attention_mask']
                 )
             
@@ -207,7 +207,14 @@ def main():
         return
     
     print(f"\n🎯 Model successfully loaded! Ready to demonstrate denoising capabilities.")
-    
+    print(f"\n📊 MODEL METADATA")
+    print(f"{'='*50}")
+    print(f"• Model Type: BART Diffusion Language Model")
+    print(f"• Noise Scheduler: {diffusion_model.scheduler.__class__.__name__}")
+    print(f"• Model Parameters: {sum(p.numel() for p in diffusion_model.parameters()):,}")
+    print(f"• Device: {device}")
+    print(f"{'='*50}")
+
     # Test model performance with correct metrics
     performance_results = test_model_performance(diffusion_model, bart_model, tokenizer, device, num_samples=15)
     

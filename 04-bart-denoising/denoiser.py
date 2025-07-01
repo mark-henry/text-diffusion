@@ -7,7 +7,7 @@ import torch.nn.functional as F
 
 
 class CosineNoiseScheduler:
-    def __init__(self, num_timesteps: int = 2000, s: float = 0.008):
+    def __init__(self, num_timesteps: int = 2000, s: float = 1e-4):
         self.num_timesteps = num_timesteps
         self.s = s
         
@@ -17,12 +17,23 @@ class CosineNoiseScheduler:
         alphas_cumprod = alphas_cumprod / alphas_cumprod[0]  # Normalize to start at 1
         
         # Ensure no negative values and proper bounds
-        alphas_cumprod = torch.clamp(alphas_cumprod, min=1e-8, max=1.0)
+        alphas_cumprod = torch.clamp(alphas_cumprod[1:], min=1e-8, max=1.0)  # Remove first element
         
-        # Compute betas from alphas_cumprod
+        # Compute posterior quantities following DDPM
         self.alphas_cumprod = alphas_cumprod
-        self.alphas = alphas_cumprod[1:] / alphas_cumprod[:-1]
+        self.alphas_cumprod_prev = torch.cat([torch.tensor([1.0]), alphas_cumprod[:-1]])
+        
+        # Compute alphas and betas
+        self.alphas = alphas_cumprod / self.alphas_cumprod_prev
         self.betas = 1 - self.alphas
+        
+        # Compute posterior variance (clipped to prevent numerical issues)
+        self.posterior_variance = (
+            self.betas * (1.0 - self.alphas_cumprod_prev) / (1.0 - self.alphas_cumprod)
+        )
+        # Clip the first value to avoid log(0)
+        self.posterior_variance = torch.clamp(self.posterior_variance, min=1e-20)
+        self.posterior_log_variance_clipped = torch.log(self.posterior_variance)
         
     def add_noise(self, latents: torch.Tensor, timesteps: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Add noise to latents according to timesteps."""
@@ -48,24 +59,36 @@ class SqrtNoiseScheduler:
     - Then slows down to avoid spending too many steps on very high-noise problems
     - Better suited for discrete text data where small noise doesn't change nearest neighbors
     """
-    def __init__(self, num_timesteps: int = 2000, s: float = 0.008):
+    def __init__(self, num_timesteps: int = 2000, s: float = 1e-4):
         self.num_timesteps = num_timesteps
         self.s = s
         
         # Compute alphas_cumprod using sqrt schedule: α̅_t = 1 - √(t/T + s)
-        t = torch.linspace(0, num_timesteps, num_timesteps + 1)
+        # Note: t goes from 0 to num_timesteps-1 for the actual timesteps
+        t = torch.arange(0, num_timesteps, dtype=torch.float32)
         alphas_cumprod = 1 - torch.sqrt((t / num_timesteps) + s)
         
         # Ensure no negative values and proper bounds
         alphas_cumprod = torch.clamp(alphas_cumprod, min=1e-8, max=1.0)
         
-        # Normalize to start at 1 (t=0 should have no noise)
-        alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
+        # At t=0: α̅_0 = 1 - √(s) ≈ 1 - 0.01 = 0.99 (with s=1e-4)
+        # This gives initial std dev of √(1-0.99) = 0.1 as intended
         
-        # Compute betas from alphas_cumprod
+        # Compute posterior quantities following DDPM
         self.alphas_cumprod = alphas_cumprod
-        self.alphas = alphas_cumprod[1:] / alphas_cumprod[:-1]
+        self.alphas_cumprod_prev = torch.cat([torch.tensor([1.0]), alphas_cumprod[:-1]])
+        
+        # Compute alphas and betas
+        self.alphas = alphas_cumprod / self.alphas_cumprod_prev
         self.betas = 1 - self.alphas
+        
+        # Compute posterior variance (clipped to prevent numerical issues)
+        self.posterior_variance = (
+            self.betas * (1.0 - self.alphas_cumprod_prev) / (1.0 - self.alphas_cumprod)
+        )
+        # Clip the first value to avoid log(0)
+        self.posterior_variance = torch.clamp(self.posterior_variance, min=1e-20)
+        self.posterior_log_variance_clipped = torch.log(self.posterior_variance)
         
     def add_noise(self, latents: torch.Tensor, timesteps: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Add noise to latents according to timesteps."""
@@ -119,11 +142,11 @@ class BartDiffusionLM(nn.Module):
     - Predicts clean latents x_0 instead of noise
     - Uses sinusoidal time embeddings for timestep conditioning
     """
-    def __init__(self, bart_model_name="facebook/bart-base", max_length=64, time_embed_dim=256, num_timesteps=2000, scheduler=None, dropout=0.1):
+    def __init__(self, bart_model_name="facebook/bart-base", max_length=64, time_embed_dim=None, num_timesteps=2000, scheduler=None, dropout=0.1):
         super().__init__()
         self.max_length = max_length
         self.num_timesteps = num_timesteps
-        self.time_embed_dim = time_embed_dim
+        self.time_embed_dim = time_embed_dim if time_embed_dim is not None else self.bart_config.d_model
         self.dropout_prob = dropout
         
         # Initialize noise scheduler - use sqrt schedule by default as recommended in paper
@@ -179,16 +202,12 @@ class BartDiffusionLM(nn.Module):
         # dropout layer 
         self.dropout = nn.Dropout(dropout)
         
-        # Time embedding layers (sinusoidal encoding + MLP)
+        # Time embedding layers (following Diffusion-LM reference architecture)
         self.time_embed = nn.Sequential(
             nn.Linear(time_embed_dim, time_embed_dim),
             nn.SiLU(),
-            nn.Linear(time_embed_dim, time_embed_dim),
-            nn.SiLU(),
+            nn.Linear(time_embed_dim, self.bart_config.d_model),
         )
-        
-        # Project time embedding into BART's embedding space for injection
-        self.time_proj = nn.Linear(time_embed_dim, self.bart_config.d_model)
         
     @property
     def scheduler(self):
@@ -245,7 +264,7 @@ class BartDiffusionLM(nn.Module):
         # This is the key mechanism that prevents embedding collapse
         embed_weight = self.bart_model.get_encoder().embed_tokens.weight
         assert isinstance(embed_weight, torch.Tensor), "Expected embedding weight to be a tensor"
-        return torch.nn.functional.linear(hidden_states, embed_weight)
+        return F.linear(hidden_states, embed_weight)
 
     def get_sinusoidal_embedding(self, timesteps, embedding_dim):
         """
@@ -265,11 +284,11 @@ class BartDiffusionLM(nn.Module):
         """
         Forward pass: predict clean latents x_0 from noisy latents x_t and timestep t.
         
-        Architecture:
-        1. Time embedding: sinusoidal encoding of timestep 
-        2. Combine: noisy_latents + time (noisy_latents already contain position info)
-        3. Layer normalization and dropout
-        4. BART encoder: process time-conditioned latents using inputs_embeds
+        Architecture (following Diffusion-LM reference):
+        1. Time embedding: sinusoidal encoding
+        2. Combine: noisy latents + time conditioning
+        3. Layer norm and dropout
+        4. BART transformer: process time-conditioned latents
         5. Direct output: encoder output is the predicted clean latents
         
         Args:
@@ -287,26 +306,25 @@ class BartDiffusionLM(nn.Module):
         
         # 1. Create time embeddings using sinusoidal encoding
         time_emb = self.get_sinusoidal_embedding(timesteps, self.time_embed_dim).to(noisy_latents.device)
-        time_emb = self.time_embed(time_emb)  # [B, time_embed_dim]
+        time_emb = self.time_embed(time_emb)  # [B, d_model]
+        # Add time conditioning to all positions (broadcast time embedding)
+        time_proj = time_emb.unsqueeze(1).expand(-1, seq_len, -1)  # [B, L, d_model]
         
-        # 2. Project time embedding to BART's embedding dimension
-        time_proj = self.time_proj(time_emb)  # [B, d_model]
-        time_proj = time_proj.unsqueeze(1).expand(-1, seq_len, -1)  # [B, L, d_model]
-        
-        # 3. Combine noisy latents with time conditioning
+        # 2. Combine noisy latents with time conditioning
         emb_inputs = noisy_latents + time_proj  # [B, L, d_model]
         
-        # 4. Apply layer normalization and dropout
+        # 3. Apply layer normalization and dropout
         emb_inputs = self.layernorm_embedding(emb_inputs)
         emb_inputs = self.dropout(emb_inputs)
         
-        # 5. Create attention mask if not provided
+        # 4. Process through BART encoder using inputs_embeds
+        
+        # Create attention mask if not provided
         if attention_mask is None:
             attention_mask = torch.ones(batch_size, seq_len, device=noisy_latents.device, dtype=torch.bool)
         else:
             attention_mask = attention_mask.bool()
-        
-        # 6. Process through BART encoder using inputs_embeds
+            
         encoder_outputs = self.bart_model.encoder(
             inputs_embeds=emb_inputs,
             attention_mask=attention_mask,
@@ -315,7 +333,7 @@ class BartDiffusionLM(nn.Module):
             return_dict=True
         )
         
-        # 7. Direct output: encoder output is the predicted clean latents (no projection needed)
+        # 5. Direct output: encoder output is the predicted clean latents (no projection needed)
         predicted_x0 = encoder_outputs.last_hidden_state
         
         return predicted_x0
@@ -418,7 +436,10 @@ def get_substantial_texts_from_dataset(dataset, min_length=100, max_samples=None
 
 def clamp_to_embeddings(predicted_x0, diffusion_model, attention_mask=None):
     """
-    Clamp predicted latents to nearest word embeddings (the "clamping trick").
+    Clamp predicted latents to nearest word embeddings using L2 distance (the "clamping trick").
+    
+    Following the reference Diffusion-LM implementation (logits_mode=2) which uses
+    L2 distance rather than cosine similarity for better magnitude sensitivity.
     
     Args:
         predicted_x0: [B, L, C] predicted clean latents
@@ -437,13 +458,19 @@ def clamp_to_embeddings(predicted_x0, diffusion_model, attention_mask=None):
     # Reshape for batch computation
     pred_flat = predicted_x0.view(-1, embed_dim)  # [B*L, embed_dim]
     
-    # Compute cosine similarities to all vocabulary embeddings
-    pred_normalized = F.normalize(pred_flat, p=2, dim=1)  # [B*L, embed_dim]
-    vocab_normalized = F.normalize(vocab_embeddings, p=2, dim=1)  # [vocab_size, embed_dim]
-    similarities = torch.mm(pred_normalized, vocab_normalized.t())  # [B*L, vocab_size]
+    # Use L2 distance like reference implementation (logits_mode=2)
+    # Compute squared norms for efficiency: ||a - b||² = ||a||² + ||b||² - 2⟨a,b⟩
+    vocab_norm_sq = (vocab_embeddings ** 2).sum(-1).view(-1, 1)  # [vocab_size, 1]
+    pred_norm_sq = (pred_flat ** 2).sum(-1).view(-1, 1)  # [B*L, 1]
     
-    # Find nearest embedding for each position
-    nearest_indices = torch.argmax(similarities, dim=1)  # [B*L]
+    # Compute dot products
+    dot_products = torch.mm(pred_flat, vocab_embeddings.t())  # [B*L, vocab_size]
+    
+    # Compute L2 distances squared: ||pred - vocab||²
+    distances_sq = vocab_norm_sq.t() + pred_norm_sq - 2.0 * dot_products  # [B*L, vocab_size]
+    
+    # Find nearest embedding (minimum distance)
+    nearest_indices = torch.argmin(distances_sq, dim=1)  # [B*L]
     
     # Get the corresponding embeddings
     clamped_flat = vocab_embeddings[nearest_indices]  # [B*L, embed_dim]
@@ -466,13 +493,16 @@ def clamp_to_embeddings(predicted_x0, diffusion_model, attention_mask=None):
 
 def diffusion_sample_step(xt, t, diffusion_model, device, use_clamping=True, attention_mask=None):
     """
-    Single sampling step using the clamping trick from Diffusion-LM paper.
+    Single sampling step using proper DDPM posterior sampling.
     
-    Implements: xt-1 = √(α̅_{t-1}) · Clamp(fθ(xt, t)) + √(1 - α̅_{t-1}) · ε
+    Implements stable DDPM sampling following the reference implementation:
+    1. Predict x0 using the model
+    2. Use precomputed posterior coefficients for stability  
+    3. Sample from posterior with clipped variance
     
     Args:
         xt: [B, L, C] noisy latents at timestep t
-        t: timestep (scalar)
+        t: timestep (integer) - discrete timestep index in range [0, num_timesteps-1]
         diffusion_model: Trained diffusion model
         device: Device to run on
         use_clamping: Whether to apply clamping trick
@@ -496,23 +526,38 @@ def diffusion_sample_step(xt, t, diffusion_model, device, use_clamping=True, att
         if use_clamping:
             predicted_x0, _ = clamp_to_embeddings(predicted_x0, diffusion_model, attention_mask)
         
-        # 3. Sample xt-1 using the predicted (and possibly clamped) x0
+        # 3. Handle the case where t=0 (already at x0)
         if t == 0:
-            # Already at x0, no more sampling needed
             return predicted_x0, predicted_x0
         
-        # Get noise schedule values
-        alpha_bar_t_minus_1 = diffusion_model.scheduler.alphas_cumprod[t-1] if t > 0 else torch.tensor(1.0)
-        alpha_bar_t_minus_1 = alpha_bar_t_minus_1.to(device)
+        # 4. Use precomputed posterior coefficients for stability
+        scheduler = diffusion_model.scheduler
         
-        # Sample noise
-        noise = torch.randn_like(xt)
+        # Get precomputed values (move to device)
+        alphas_cumprod = scheduler.alphas_cumprod[t].to(device)
+        alphas_cumprod_prev = scheduler.alphas_cumprod_prev[t].to(device)
+        betas = scheduler.betas[t].to(device)
+        posterior_variance = scheduler.posterior_variance[t].to(device)
         
-        # Apply formula: xt-1 = √(α̅_{t-1}) · x0_pred + √(1 - α̅_{t-1}) · ε
-        sqrt_alpha_bar = torch.sqrt(alpha_bar_t_minus_1)
-        sqrt_one_minus_alpha_bar = torch.sqrt(1 - alpha_bar_t_minus_1)
+        # Compute posterior mean coefficients (following DDPM paper exactly)
+        # coef1 = β_t * √ᾱ_{t-1} / (1 - ᾱ_t)
+        # coef2 = (1 - ᾱ_{t-1}) * √α_t / (1 - ᾱ_t)
+        coef1 = betas * torch.sqrt(alphas_cumprod_prev) / (1.0 - alphas_cumprod)
+        coef2 = (1.0 - alphas_cumprod_prev) * torch.sqrt(scheduler.alphas[t].to(device)) / (1.0 - alphas_cumprod)
         
-        xt_minus_1 = sqrt_alpha_bar * predicted_x0 + sqrt_one_minus_alpha_bar * noise
+        # Compute posterior mean: μ = coef1 * x_0 + coef2 * x_t
+        posterior_mean = coef1 * predicted_x0 + coef2 * xt
+        
+        # Use precomputed clipped variance for stability
+        posterior_std = torch.sqrt(posterior_variance)
+        
+        # 5. Sample from posterior: x_{t-1} ~ N(μ, σ²)
+        # Only add noise if t > 0
+        if t > 0:
+            noise = torch.randn_like(xt)
+            xt_minus_1 = posterior_mean + posterior_std * noise
+        else:
+            xt_minus_1 = posterior_mean
         
         return xt_minus_1, predicted_x0
 
@@ -526,7 +571,8 @@ def demo_denoising_step(text, diffusion_model, tokenizer, device, timestep=1, ma
         diffusion_model: Trained diffusion model
         tokenizer: BART tokenizer
         device: Device to run on
-        timestep: Noise level (lower = less noise)
+        timestep: Noise level (integer) - discrete timestep index in range [0, num_timesteps-1]
+                 Lower values = less noise (e.g., timestep=0 is minimal noise)
         max_length: Maximum sequence length
     
     Returns:

@@ -92,41 +92,52 @@ def progressive_denoising_demo(
         print(f"⚠️ Reducing num_steps to {total_timesteps} (model's max timesteps)")
     
     # Create timestep schedule (from high to low)
-    timesteps = torch.linspace(total_timesteps-1, 0, num_steps, dtype=torch.long)
+    timesteps = torch.linspace(total_timesteps-2, 0, num_steps, dtype=torch.long)
     
     # Show five intermediate steps
     show_at_steps = [0, num_steps//4, num_steps//2, 3*num_steps//4, num_steps-1] if show_intermediate_steps else [num_steps-1]
     
     print(f"\n🌟 Starting progressive denoising over {num_steps} steps...")
     print(f"🕐 Timestep range: {timesteps[0].item()} → {timesteps[-1].item()}")
-    print(f"🔍 Clamping enabled: {use_clamping}")
+    if use_clamping:
+        clamp_start_step = int(0.9 * num_steps) + 1
+        print(f"🔍 Clamping: Disabled for first 90% of steps, enabled from step {clamp_start_step}")
+    else:
+        print(f"🔍 Clamping: Disabled throughout")
     print("=" * 80)
     
     # Progressive denoising loop
     for step_idx, t in enumerate(timesteps):
         t_scalar = t.item()
         
+        # Enable clamping only when we're 90% through the schedule
+        step_progress = step_idx / (num_steps - 1)  # 0.0 to 1.0
+        current_use_clamping = use_clamping and (step_progress >= 0.90)
+        
         # Perform one denoising step
         with torch.no_grad():
             xt, predicted_x0 = diffusion_sample_step(
                 xt, t_scalar, model, device, 
-                use_clamping=use_clamping, attention_mask=attention_mask
+                use_clamping=current_use_clamping, attention_mask=attention_mask
             )
         
         # Show intermediate results
-        if step_idx in show_at_steps or step_idx > 0.75*num_steps:
+        if step_idx in show_at_steps or step_idx > 0.80*num_steps:
             # Calculate noise level
             if t_scalar > 0:
                 noise_level = (1 - model.scheduler.alphas_cumprod[int(t_scalar)].item()) * 100
             else:
                 noise_level = 0.0
             
-            print(f"\n📍 Step {step_idx+1}/{num_steps} (t={t_scalar}, noise={noise_level:.1f}%)")
+            clamp_status = "🔒 ON" if current_use_clamping else "🔓 OFF"
+            print(f"\n📍 Step {step_idx+1}/{num_steps} (t={t_scalar}, noise={noise_level:.1f}%, clamp={clamp_status})")
             
             # Decode current latents to text
             try:
                 current_text = decode_latents_to_text(xt, model, tokenizer, attention_mask)
                 print(f"🔤 Current text: '{current_text}'")
+                predicted_text = decode_latents_to_text(predicted_x0, model, tokenizer, attention_mask)
+                print(f"🔤 Predicted final text: '{predicted_text}'")
             except Exception as e:
                 print(f"⚠️ Decoding failed: {e}")
             
@@ -150,7 +161,7 @@ def progressive_denoising_demo(
     print(f"   • Model: {model_path}")
     print(f"   • Sequence length: {seq_len}")
     print(f"   • Denoising steps: {num_steps}")
-    print(f"   • Clamping: {use_clamping}")
+    print(f"   • Clamping: {'Enabled after 90% of steps' if use_clamping else 'Disabled'}")
     print(f"   • Final latent norm: {torch.norm(xt).item():.3f}")
     
     return xt, final_text

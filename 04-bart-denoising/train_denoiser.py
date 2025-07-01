@@ -256,12 +256,12 @@ def train_denoiser(
         # COMPONENT 2: Embedding alignment loss
         # From Li et al. 2022: Only apply embedding alignment at t=0
         t0_mask = (timesteps == 0)
-        # Get learnable embeddings for all samples (will be masked appropriately)
-        learnable_embeddings = model.embed_tokens(input_ids, attention_mask)  # type: ignore
+        # Get learned embeddings for all samples (will be masked appropriately)
+        learned_embeddings = model.embed_tokens(input_ids, attention_mask)
         
         # Compute embedding alignment loss for t=0 samples
         t0_embedding_loss = F.mse_loss(
-            learnable_embeddings * attention_mask.unsqueeze(-1),
+            learned_embeddings * attention_mask.unsqueeze(-1),
             predicted_x0 * attention_mask.unsqueeze(-1),
             reduction='none'
         )
