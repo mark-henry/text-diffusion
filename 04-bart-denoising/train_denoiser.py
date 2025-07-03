@@ -1,29 +1,157 @@
 import torch
-import torch.nn as nn
 from torch.utils.data import DataLoader, random_split
-from transformers import BartTokenizer
+from transformers import BartTokenizer, BartConfig
 from tqdm import tqdm
 from datasets import load_dataset
 import wandb
 import time
 import os
-from typing import List, Tuple, Dict
+import signal
+import sys
+import random
+import pickle
+from typing import List, Tuple, Dict, Optional
 import torch.nn.functional as F
 
 # Set CUDA memory allocation configuration for better memory management
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 
+# Set cache directory for datasets
+CACHE_DIR = "/mnt/win/Users/markhenry/.cache/huggingface"
+os.environ['HF_HOME'] = CACHE_DIR
+
 from denoiser import (
     BartDiffusionLM, 
-    SqrtNoiseScheduler, 
-    TextDataset, 
-    load_checkpoint,
-    get_substantial_texts_from_dataset,
     demo_denoising_step,
     token_discrete_loss
 )
+from dataset_utils import calculate_optimal_examples, StreamingTextDataset, collect_validation_examples, ValidationDataset
 
-def validate_model(model, val_loader, loss_fn, device, demo_text=None, tokenizer=None):
+# Model configurations optimized for specific training times
+MODEL_CONFIGS = {
+    "tiny": {
+        "vocab_size": 2000,
+        "batch_size": 96,
+        "description": "Tiny (~1.6M params)",
+        "d_model": 128,
+        "encoder_layers": 1,
+        "attention_heads": 2,
+        "sequence_length": 32,
+    },
+    "small": {
+        "vocab_size": 3000,
+        "batch_size": 128,
+        "description": "Small (3.6M params)",
+        "d_model": 160,
+        "encoder_layers": 2,
+        "attention_heads": 4,
+        "sequence_length": 48,
+    },
+    "medium": {
+        "vocab_size": 5000,
+        "batch_size": 128,
+        "description": "Medium (8.8M params)",
+        "d_model": 256,
+        "encoder_layers": 3,
+        "attention_heads": 4,
+        "sequence_length": 64,
+    }
+}
+
+# Global variable to hold training state for graceful interruption
+training_state = {
+    'model': None,
+    'current_epoch': 0,
+    'best_val_loss': float('inf'),
+    'current_val_loss': None,
+    'current_val_cosine_sim': None,
+    'current_val_magnitude_ratio': None,
+    'optimizer': None,
+    'config_info': None,
+}
+
+def signal_handler(signum, frame):
+    """Handle Ctrl-C interruption by saving current model state"""
+    print(f"\n\n⚠️  Training interrupted (signal {signum})! Saving current state...")
+    
+    try:
+        if training_state['model'] is not None:
+            # Save current model as interrupted checkpoint
+            current_checkpoint = {
+                'model_state_dict': training_state['model'].state_dict(),
+                'epoch': training_state['current_epoch'],
+                'best_val_loss': training_state['best_val_loss'],
+                'val_loss': training_state['current_val_loss'],
+                'val_cosine_sim': training_state['current_val_cosine_sim'],
+                'val_magnitude_ratio': training_state['current_val_magnitude_ratio'],
+                'learning_rate': training_state['optimizer'].param_groups[0]['lr'] if training_state['optimizer'] else None,
+                'interrupted': True,
+                'config_info': training_state.get('config_info'),
+            }
+            
+            # Save as interrupted checkpoint
+            interrupted_path = f"interrupted_epoch_{training_state['current_epoch']}_diffusion_lm.pt"
+            torch.save(current_checkpoint, interrupted_path)
+            print(f"💾 Saved interrupted checkpoint to: {interrupted_path}")
+            
+            print(f"✅ Training state saved! You can resume with:")
+            print(f"   python train_denoiser.py --checkpoint {interrupted_path}")
+        else:
+            print(f"❌ No model to save (training not started yet)")
+    except Exception as e:
+        print(f"⚠️ Error saving checkpoint: {e}")
+        print(f"🚨 Forcing exit without saving...")
+    
+    print(f"👋 Exiting now...")
+    
+    # Force immediate exit
+    try:
+        if wandb.run is not None:
+            wandb.finish()
+    except:
+        pass
+    
+    os._exit(1)  # Force exit without cleanup
+
+# Register signal handler for Ctrl-C
+signal.signal(signal.SIGINT, signal_handler)
+
+def bart_config(model_config: dict) -> BartConfig:
+    return BartConfig(
+        vocab_size=model_config['vocab_size'],
+        d_model=model_config['d_model'],
+        encoder_layers=model_config['encoder_layers'],
+        decoder_layers=model_config['encoder_layers'],
+        encoder_attention_heads=model_config['attention_heads'],
+    )
+
+def config_info(model):
+    return {
+        'vocab_size': model.bart_config.vocab_size,
+        'd_model': model.bart_config.d_model,
+        'encoder_layers': model.bart_config.encoder_layers,
+        'decoder_layers': model.bart_config.decoder_layers,
+        'max_length': model.max_length,
+        'time_embed_dim': model.time_embed_dim,
+        'num_timesteps': model.scheduler.num_timesteps,
+        'dropout': model.dropout_prob,
+        'bart_config': model.bart_config,
+    }
+
+def create_model(config_info: dict):
+    model = BartDiffusionLM(
+        bart_model_name="facebook/bart-base",  # Not used when custom_config provided
+        max_length=64,
+        time_embed_dim=256,
+        num_timesteps=2000,
+        dropout=0.1,
+        custom_config=bart_config(config_info)
+    )
+    
+    return model
+
+
+def validate_model(model, val_loader, loss_fn, device, demo_example=None, tokenizer=None):
     """Validate the model with the new Diffusion-LM loss."""
     model.eval()
     val_total_loss = 0
@@ -82,7 +210,7 @@ def validate_model(model, val_loader, loss_fn, device, demo_text=None, tokenizer
             num_batches += 1
             
             # Collect loss vs timestep and cosine similarity vs timestep data (sample every few batches to avoid too much data)
-            if num_batches % 20 == 0:  # Sample every 5th batch
+            if num_batches % 20 == 0:  # Sample every 20th batch
                 # Compute per-sample losses and cosine similarities for timestep analysis
                 for i in range(batch_size):
                     t = timesteps[i].item()
@@ -178,11 +306,11 @@ def validate_model(model, val_loader, loss_fn, device, demo_text=None, tokenizer
     })
     
     # Demo denoising during validation
-    if demo_text and tokenizer:
+    if demo_example and tokenizer:
         try:
             print(f"\n🎭 VALIDATION DEMO - Denoising at timestep 1:")
             demo_result = demo_denoising_step(
-                demo_text, model, tokenizer, device, timestep=1
+                demo_example, model, tokenizer, device, timestep=1
             )
             
             print(f"   📝 Original: {demo_result['original_text']}")
@@ -209,11 +337,10 @@ def train_denoiser(
     train_loader: DataLoader,
     val_loader: DataLoader,
     num_epochs: int,
+    config_info: dict,
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
     start_epoch: int = 0,
     initial_best_val_loss: float = float('inf'),
-    demo_text = None,
-    bart_model = None,
     tokenizer = None
 ) -> Dict[str, List[float]]:
     """
@@ -225,13 +352,13 @@ def train_denoiser(
     
     def diffusion_lm_loss(predicted_x0, target_x0, noisy_latents, input_ids, attention_mask, timesteps):
         """
-        Li et al. 2022 three-component loss function: L_e2e_simple(w)
+        Li et al. 2022 three-component loss function
         
         L_e2e_simple(w) = E_q[L_simple(x_0) + ||EMB(w) - μ_θ(x_1, 1)||² - log p_θ(w|x_0)]
         
         Components:
         1. L_simple: Standard diffusion loss - MSE between predicted and target clean latents
-        2. Embedding loss: ||EMB(w) - μ_θ(x_1, 1)||² - prediction from noisiest state vs learnable embedding
+        2. Embedding loss: ||EMB(w) - μ_θ(x_1, 1)||² - prediction from least noisy state vs learnable embedding
         3. Reconstruction loss: -log p_θ(w|x_0) - cross-entropy for rounding back to vocabulary
         
         Args:
@@ -256,16 +383,16 @@ def train_denoiser(
         # COMPONENT 2: Embedding alignment loss
         # From Li et al. 2022: Only apply embedding alignment at t=0
         t0_mask = (timesteps == 0)
-        # Get learned embeddings for all samples (will be masked appropriately)
-        learned_embeddings = model.embed_tokens(input_ids, attention_mask)
+        # Get target embeddings for all samples (will be masked appropriately)
+        target_embeddings = model.embed_tokens(input_ids, attention_mask)
         
         # Compute embedding alignment loss for t=0 samples
         t0_embedding_loss = F.mse_loss(
-            learned_embeddings * attention_mask.unsqueeze(-1),
+            target_embeddings * attention_mask.unsqueeze(-1),
             predicted_x0 * attention_mask.unsqueeze(-1),
             reduction='none'
         )
-        
+            
         # Use embedding alignment for t=0 samples, standard MSE for others
         corrected_loss = torch.where(
             t0_mask.unsqueeze(-1).unsqueeze(-1),
@@ -326,8 +453,8 @@ def train_denoiser(
             'total_samples': batch_size,
         }
     
-    # Adaptive learning rate based on performance
-    base_lr = 5e-5  # Lower learning rate for pretrained BART
+    # Adaptive learning rate based on model size
+    base_lr = 5e-5 if config_info["vocab_size"] <= 15000 else 2e-5  # Lower LR for larger models
     optimizer = torch.optim.AdamW(model.parameters(), lr=base_lr, weight_decay=0.01)
     
     # Use ReduceLROnPlateau with validation loss (lower is better)
@@ -344,12 +471,32 @@ def train_denoiser(
     }
     
     best_val_loss = initial_best_val_loss
-    patience = 4
+    patience = 2
     patience_counter = 0
+    
+    # Update global training state for graceful interruption
+    global training_state
+    training_state.update({
+        'model': model,
+        'current_epoch': start_epoch,
+        'best_val_loss': best_val_loss,
+        'optimizer': optimizer,
+        'config_info': config_info,
+    })
     
     print(f"🚀 Starting Diffusion-LM training from epoch {start_epoch} to {start_epoch + num_epochs}")
     
+    # select demo example from train loader
+    demo_batch = next(iter(train_loader))
+    demo_example = {
+        'input_ids': demo_batch['input_ids'][1],  # Take an example from batch
+        'attention_mask': demo_batch['attention_mask'][1]
+    }
+    
     for epoch in range(start_epoch, start_epoch + num_epochs):
+        # Update training state for current epoch
+        training_state['current_epoch'] = epoch
+        
         model.train()
         epoch_losses = {
             'total': 0, 'l2': 0, 'l1': 0
@@ -439,8 +586,15 @@ def train_denoiser(
         # Validation
         val_loss, val_cosine_sim, val_magnitude_ratio = validate_model(
             model, val_loader, diffusion_lm_loss, device, 
-            demo_text=demo_text, tokenizer=tokenizer
+            demo_example=demo_example, tokenizer=tokenizer
         )
+        
+        # Update training state with current validation metrics
+        training_state.update({
+            'current_val_loss': val_loss,
+            'current_val_cosine_sim': val_cosine_sim,
+            'current_val_magnitude_ratio': val_magnitude_ratio
+        })
         
         # Calculate epoch metrics
         num_batches = len(train_loader)
@@ -529,7 +683,6 @@ def train_denoiser(
         print(f"   Cosine Similarity - Train: {avg_train_cosine_sim:.4f} | Val: {val_cosine_sim:.4f}")
         print(f"   Magnitude Ratio - Train: {avg_train_magnitude_ratio:.4f} | Val: {val_magnitude_ratio:.4f}")
         print(f"   Denoising Improvement: {avg_denoising_improvement:.4f}")
-        print(f"   Loss Breakdown - L2: {epoch_losses['l2']/num_batches:.4f} | L1: {epoch_losses['l1']/num_batches:.4f}")
         
         # Magnitude analysis
         magnitude_scale = avg_train_pred_magnitude / (avg_train_target_magnitude + 1e-8)
@@ -550,7 +703,9 @@ def train_denoiser(
             best_val_loss = val_loss
             patience_counter = 0
             
-            # Save comprehensive checkpoint
+            # Update training state with new best
+            training_state['best_val_loss'] = best_val_loss
+            
             checkpoint = {
                 'model_state_dict': model.state_dict(),
                 'epoch': epoch,
@@ -558,7 +713,10 @@ def train_denoiser(
                 'val_loss': val_loss,
                 'val_cosine_sim': val_cosine_sim,
                 'val_magnitude_ratio': val_magnitude_ratio,
-                'learning_rate': optimizer.param_groups[0]['lr']
+                'learning_rate': optimizer.param_groups[0]['lr'],
+                'config_info': config_info,  # Save config for demos
+                'checkpoint_version': '1',
+                'save_timestamp': time.time(),
             }
             torch.save(checkpoint, "best_diffusion_lm_denoiser.pt")
         else:
@@ -601,24 +759,168 @@ def train_denoiser(
     
     return history
 
-def main(checkpoint_path=None, continue_training=False):
-    # Determine run name based on whether we're continuing training
-    run_name = "diffusion-lm-bart-v4"
+def count_model_parameters(model: torch.nn.Module, verbose: bool = True) -> int:
+    """
+    Count the total number of parameters in a PyTorch model.
     
-    # Initialize wandb
+    Args:
+        model: PyTorch model to count parameters for
+        verbose: Whether to print detailed breakdown
+        
+    Returns:
+        Total number of parameters
+    """
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    
+    if verbose:
+        print(f"🔢 Parameter Count:")
+        print(f"   Total parameters: {total_params:,} ({total_params/1e6:.1f}M)")
+        print(f"   Trainable parameters: {trainable_params:,} ({trainable_params/1e6:.1f}M)")
+        
+        if total_params != trainable_params:
+            frozen_params = total_params - trainable_params
+            print(f"   Frozen parameters: {frozen_params:,} ({frozen_params/1e6:.1f}M)")
+    
+    return total_params
+
+def load_checkpoint(checkpoint_path: str, device: Optional[str] = None) -> Tuple[Optional[BartDiffusionLM], Optional[Dict], bool]:
+    """
+    Robustly load a diffusion model by detecting configuration from the checkpoint.
+    
+    This function reads the saved configuration metadata from the checkpoint and 
+    automatically creates the model with the correct parameters.
+    
+    Args:
+        checkpoint_path: Path to the checkpoint file
+        device: Device to load on (auto-detect if None)
+        
+    Returns:
+        Tuple of (model, checkpoint_metadata, success)
+        checkpoint_metadata contains epoch, loss, and other training info
+    """
+    if device is None:
+        device_obj = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    else:
+        device_obj = torch.device(device)
+        
+    try:
+        print(f"🔍 Loading model configuration from: {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path, map_location=device_obj)
+        
+        if not isinstance(checkpoint, dict):
+            raise ValueError("Checkpoint must be a dictionary with model_state_dict")
+            
+        # Try to detect configuration from saved metadata (new format)
+        config_info = None
+        
+        if 'config_info' in checkpoint and checkpoint['config_info'] is not None:
+            print("✅ Found config_info in checkpoint")
+            config_info = checkpoint['config_info']
+        
+        if config_info is None:
+            raise ValueError("Cannot detect model configuration, no model configuration present")
+        
+        print(f"🤖 Using model with config: d_model={config_info['d_model']}, layers={config_info['encoder_layers']}, vocab={config_info['vocab_size']}")
+        
+        # Create the model - use defaults for missing keys
+        model = BartDiffusionLM(
+            bart_model_name="facebook/bart-base",  # Not used when custom_config provided
+            max_length=config_info.get('max_length', 64),
+            time_embed_dim=config_info.get('time_embed_dim', 256),
+            num_timesteps=config_info.get('num_timesteps', 2000),
+            dropout=config_info.get('dropout', 0.1),
+            custom_config=bart_config(config_info)
+        ).to(device_obj)
+        
+        # Load the state dict
+        model.load_state_dict(checkpoint['model_state_dict'])
+        model.eval()
+        
+        # Prepare metadata
+        metadata = {
+            'epoch': checkpoint.get('epoch', 0),
+            'best_val_loss': checkpoint.get('best_val_loss', float('inf')),
+            'val_loss': checkpoint.get('val_loss', None),
+            'val_cosine_sim': checkpoint.get('val_cosine_sim', None),
+            'val_magnitude_ratio': checkpoint.get('val_magnitude_ratio', None),
+            'config_info': config_info,
+            'checkpoint_version': checkpoint.get('checkpoint_version', 'legacy'),
+            'save_timestamp': checkpoint.get('save_timestamp', None)
+        }
+        
+        print(f"✅ Successfully loaded model")
+        print(f"📊 Model stats: {count_model_parameters(model, verbose=False)/1e6:.1f}M parameters")
+        if metadata['epoch'] > 0:
+            print(f"🎯 Training info: Epoch {metadata['epoch']}, Best Val Loss: {metadata['best_val_loss']:.6f}")
+        
+        return model, metadata, True
+        
+    except Exception as e:
+        print(f"❌ Failed to load model with configuration: {e}")
+        import traceback
+        print(f"Full error: {traceback.format_exc()}")
+        return None, None, False
+
+
+def main(model_type: str = "tiny", checkpoint_path=None):
+    """
+    Main training function with configurable model types.
+    
+    Args:
+        model_type: from MODEL_CONFIGS
+        checkpoint_path: Path to checkpoint for resuming training
+    """
+    print(f"=== BART Diffusion Language Model - {model_type.upper()} ===\n")
+    
+    # Load tokenizer first
+    print("Loading BART tokenizer...")
+    tokenizer = BartTokenizer.from_pretrained("facebook/bart-base", use_fast=True)
+    
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Using device: {device}")
+    
+    # 1. CREATE MODEL AND COUNT PARAMETERS
+    print(f"\n🏗️  Creating {model_type} BART diffusion model...")
+    if checkpoint_path:
+        model, metadata, success = load_checkpoint(checkpoint_path, str(device))
+        if not success or model is None or metadata is None:
+            raise ValueError(f"Failed to load checkpoint from {checkpoint_path}")
+        start_epoch = metadata['epoch']
+        config_info = metadata['config_info']
+        model_type = 'loaded'
+        print(f"🔄 Continuing Diffusion-LM training from epoch {start_epoch + 1}")
+    else:
+        config_info = MODEL_CONFIGS[model_type]
+        model = create_model(config_info)
+        start_epoch = 0
+    
+    # Count parameters and calculate optimal dataset size  
+    param_count = count_model_parameters(model, verbose=True)
+    target_examples = calculate_optimal_examples(param_count, tokens_per_example=64)
+    
+    print(f"\n📊 Dataset Configuration:")
+    print(f"   🎯 Target examples: {target_examples:,}")
+    
+    # 2. init wandb
+    run_name = f"diffusion-lm-{model_type}-v111"
     wandb.init(
         project="text-diffusion",
         name=run_name,
         config={
-            "model_type": "BartDiffusionLM",
-            "approach": "Diffusion-LM (Li et al. 2022)",
-            "encoder": "BART-base (fully trainable)",
-            "embeddings": "BART embeddings (trainable)",
-            "dataset": "WikiText-2",
-            "batch_size": 96,
-            "learning_rate": 5e-5,  # Lower for pretrained BART
-            "num_epochs": 40,
-            "max_length": 64,
+            "model_type": f"BartDiffusionLM_{model_type.title()}",
+            "approach": f"Diffusion-LM (Li et al. 2022) - {model_type.title()}",
+            "encoder": config_info["description"],
+            "embeddings": "Custom BART embeddings (trainable)",
+            "architecture": "Custom_BART_encoder + time_embeddings",
+            "model_params": f"{param_count/1e6:.1f}M",
+            "training_examples": target_examples,
+            "batch_size": config_info["batch_size"],
+            "learning_rate": 5e-5 if config_info["vocab_size"] <= 15000 else 2e-5,
+            "num_epochs": 5,
+            "sequence_length": config_info["sequence_length"],
+            "vocab_size": config_info["vocab_size"],
+            "dataset": "OpenWebText",
             "noise_scheduler": "sqrt",
             "num_timesteps": 2000,
             "s": 0.008,
@@ -628,9 +930,8 @@ def main(checkpoint_path=None, continue_training=False):
             "dropout": 0.1,
             "loss_function": "li2022",
             "objective": "L_e2e_simple = E_q[L_simple(x_0) + ||EMB(w) - μ_θ(x_1, 1)||² - log p_θ(w|x_0)]",
-            "improvements": "dropout + weight tying fix",
+            "configuration": f"{model_type}",
             "time_encoding": "sinusoidal_embeddings",
-            "architecture": "bart_encoder",
             "time_embed_dim": 256,
             "learned_time_scaling": False,
             "trainable_embeddings": True,
@@ -639,105 +940,72 @@ def main(checkpoint_path=None, continue_training=False):
         }
     )
     
-    # Load tokenizer
-    print("Loading BART tokenizer...")
-    tokenizer = BartTokenizer.from_pretrained("facebook/bart-base")
+    # 3. Create streaming dataset
+    print(f"\n🌊 Initializing streaming dataset...")
     
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Using device: {device}")
+    # Get sequence length from config
+    sequence_length = config_info["sequence_length"]
     
-    # Load BART model for demo during validation
-    print("Loading BART model for validation demo...")
-    from transformers import BartForConditionalGeneration
-    bart_model = BartForConditionalGeneration.from_pretrained("facebook/bart-base")
-    bart_model = bart_model.to(device)  # type: ignore
-    bart_model.eval()  # Keep in eval mode for demo
+    # Create streaming training dataset
+    train_dataset = StreamingTextDataset(
+        tokenizer=tokenizer,
+        chunk_size=sequence_length,
+        vocab_size=config_info["vocab_size"],
+        num_examples=target_examples + 5000,
+    )
     
-    # Load dataset
-    print("Loading WikiText-2 dataset...")
-    dataset = load_dataset("wikitext", "wikitext-2-raw-v1")
+    # First, collect validation examples from the beginning of the stream
+    validation_examples = collect_validation_examples(
+        dataset=train_dataset,
+        num_examples=5000,
+    )
     
-    # Create text dataset for dynamic latent computation
-    print("Creating text dataset...")
-    train_texts = []
-    for item in dataset['train']:  # type: ignore  # Hugging Face datasets support iteration
-        if isinstance(item, dict) and 'text' in item and item['text'].strip():
-            train_texts.append(item['text'])
-        elif isinstance(item, str) and item.strip():
-            train_texts.append(item)
-    
-    # Load demo text for validation
-    print("Loading demo text for validation...")
-    test_dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
-    demo_texts = get_substantial_texts_from_dataset(test_dataset, min_length=150, max_samples=5)
-    demo_text = demo_texts[0] if demo_texts else "The quick brown fox jumps over the lazy dog. This is a simple test sentence for denoising demonstration."
-    print(f"📝 Demo text: {demo_text[:100]}...")
-    
-    full_dataset = TextDataset(tokenizer, train_texts, max_length=64)
-    
-    # Train/validation split
-    train_size = int(0.9 * len(full_dataset))
-    val_size = len(full_dataset) - train_size
-    train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size])
-    
-    # Optimized DataLoaders with larger batch size
-    # Note: num_workers=0 and pin_memory=False since data is already on GPU from BART inference
+    # Create validation dataset from collected examples
+    val_dataset = ValidationDataset(validation_examples)
+
+    # Optimized DataLoaders with configured batch size
+    batch_size = config_info["batch_size"]
     train_loader = DataLoader(
         train_dataset, 
-        batch_size=96,
-        shuffle=True, 
-        num_workers=0,  # Disable multiprocessing to avoid CUDA issues
+        batch_size=batch_size,
         pin_memory=False,  # Data already on GPU, pin_memory not needed
     )
     val_loader = DataLoader(
         val_dataset, 
-        batch_size=96,  # Match training batch size
+        batch_size=batch_size,  # Match training batch size
         shuffle=False, 
-        num_workers=0,  # Disable multiprocessing to avoid CUDA issues
         pin_memory=False,  # Data already on GPU, pin_memory not needed
     )
     
     # Log dataset info
     wandb.log({
-        "dataset/train_size": len(train_dataset),
+        "dataset/train_size": "streaming",
         "dataset/val_size": len(val_dataset),
-        "dataset/train_batches": len(train_loader),
-        "dataset/val_batches": len(val_loader)
+        "dataset/train_batches": "infinite",
+        "dataset/val_batches": len(val_loader),
+        "dataset/streaming": True,
+        "dataset/same_distribution": True,
+        "dataset/validation_source": "OpenWebText stream (first chunk)",
+        "dataset/training_source": "OpenWebText stream (infinite)"
     })
-    
-    # Create text-specific BART diffusion model with dropout for regularization
-    print("Creating BartDiffusionLM model for BART semantic latents...")
-    model = BartDiffusionLM(bart_model_name="facebook/bart-base", max_length=64, time_embed_dim=256, num_timesteps=2000, dropout=0.1)
     
     # Move model to device
     model = model.to(device)
     print(f"BART Diffusion model moved to device: {device}")
     
-    # Load checkpoint if specified
-    start_epoch = 0
-    initial_best_val_loss = float('inf')
-    if continue_training and checkpoint_path:
-        success, loaded_epoch, loaded_best_val_loss = load_checkpoint(model, checkpoint_path, device)
-        if success:
-            start_epoch = loaded_epoch
-            initial_best_val_loss = loaded_best_val_loss
-            print(f"🔄 Continuing Diffusion-LM training from epoch {start_epoch + 1}")
-        else:
-            print(f"⚠️  Failed to load checkpoint, starting from scratch")
-            continue_training = False
-    
-    if continue_training:
+    if checkpoint_path:
         print(f"🔄 Continuing Diffusion-LM training from epoch {start_epoch + 1}...")
+        initial_best_val_loss = metadata['best_val_loss']
     else:
-        print("🚀 Training Diffusion-LM model...")
+        print(f"🚀 Training {model_type} Diffusion-LM model...")
+        initial_best_val_loss = float('inf')
+    
     start_time = time.time()
     history = train_denoiser(
         model, train_loader, val_loader, 
-        num_epochs=40, device=device,
+        num_epochs=5, config_info=config_info, device=device,
         start_epoch=start_epoch, 
         initial_best_val_loss=initial_best_val_loss,
-        demo_text=demo_text,
-        bart_model=bart_model,
         tokenizer=tokenizer
     )
     total_time = time.time() - start_time
@@ -751,37 +1019,40 @@ def main(checkpoint_path=None, continue_training=False):
     })
     
     # Save final model
-    torch.save(model.state_dict(), "final_diffusion_lm_model.pt")
+    torch.save(model.state_dict(), f"final_{model_type}_diffusion_lm_model.pt")
     
     # Save best model as wandb artifact
     try:
-        artifact = wandb.Artifact("diffusion-lm-best", type="model")
+        artifact = wandb.Artifact(f"diffusion-lm-{model_type}-best", type="model")
         artifact.add_file("best_diffusion_lm_denoiser.pt")
         wandb.log_artifact(artifact)
     except FileNotFoundError:
         print("Warning: best_diffusion_lm_denoiser.pt not found, skipping artifact upload")
     
-    print("Diffusion-LM training complete!")
+    print(f"Diffusion-LM {model_type} training complete!")
     wandb.finish()
 
 if __name__ == "__main__":
     import sys
+    import argparse
     
-    # Parse command line arguments for checkpoint loading
-    if len(sys.argv) > 1:
-        checkpoint_path = sys.argv[1]
-        print(f"🔍 Checkpoint specified: {checkpoint_path}")
-        main(checkpoint_path=checkpoint_path, continue_training=True)
+    parser = argparse.ArgumentParser(description="Train BART Diffusion Model")
+    parser.add_argument("--model", type=str, default="tiny", choices=["tiny", "small", "medium"], 
+                       help="Model type to train")
+    parser.add_argument("--checkpoint", type=str, default=None,
+                       help="Checkpoint path to resume training from")
+    parser.add_argument("--continue", action="store_true", default=False,
+                       help="Continue training from best checkpoint")
+    
+    args = parser.parse_args()
+    
+    # For quick continuation, check for existing checkpoints
+    best_checkpoint = "best_diffusion_lm_denoiser.pt"
+    
+    if args.checkpoint:
+        # Explicit checkpoint specified
+        main(model_type=args.model, checkpoint_path=args.checkpoint)
+    elif getattr(args, 'continue', False):
+        main(model_type=args.model, checkpoint_path=best_checkpoint)
     else:
-        # For quick continuation, check if best checkpoint exists
-        import os
-        best_checkpoint = "best_diffusion_lm_denoiser.pt"
-        if os.path.exists(best_checkpoint):
-            print(f"🔍 Found existing Diffusion-LM checkpoint: {best_checkpoint}")
-            response = input("Continue training from best checkpoint? (y/n): ").lower().strip()
-            if response in ['y', 'yes']:
-                main(checkpoint_path=best_checkpoint, continue_training=True)
-            else:
-                main()
-        else:
-            main() 
+        main(model_type=args.model)

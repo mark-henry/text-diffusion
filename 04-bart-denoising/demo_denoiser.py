@@ -1,34 +1,37 @@
+from typing import Optional
 import torch
 import torch.nn.functional as F
-from transformers import BartForConditionalGeneration, BartTokenizer
+from transformers import BartTokenizer
 from datasets import load_dataset
 import random
 import numpy as np
 
 from denoiser import (
-    BartDiffusionLM, 
-    load_checkpoint,
+    BartDiffusionLM,
     get_substantial_texts_from_dataset,
     demo_denoising_step
 )
+from train_denoiser import load_checkpoint
 
 
-def load_trained_model(device, model_path="best_diffusion_lm_denoiser.pt"):
-    """Load the trained BartDiffusionLM model"""
+def load_model(device, model_path="best_diffusion_lm_denoiser.pt") -> Optional[BartDiffusionLM]:
+    """Load the trained BartDiffusionLM model with robust configuration detection"""
     print(f"Loading trained model from {model_path}...")
     
-    model = BartDiffusionLM().to(device)
+    # Use the loading function from train_denoiser
+    model, metadata, success = load_checkpoint(model_path, str(device))
     
-    # Load trained weights using the centralized function
-    success, epoch, val_loss = load_checkpoint(model, model_path, device)
-    if not success:
-        print(f"❌ Model file {model_path} not found!")
+    if not success or model is None:
+        print(f"❌ Model file {model_path} not found or couldn't be loaded!")
         return None
     
-    model.eval()
+    print(f"✅ Successfully loaded model")
+    if metadata and metadata.get('epoch', 0) > 0:
+        print(f"🎯 Training info: Epoch {metadata['epoch']}, Best Val Loss: {metadata['best_val_loss']:.6f}")
+    
     return model
 
-def test_model_performance(diffusion_model, bart_model, tokenizer, device, num_samples=10):
+def test_model_performance(diffusion_model, tokenizer, device, num_samples=10):
     """Test the model performance using training-style validation"""
     print("\n" + "="*80)
     print("🔬 MODEL PERFORMANCE EVALUATION")
@@ -60,6 +63,18 @@ def test_model_performance(diffusion_model, bart_model, tokenizer, device, num_s
             # Encode text exactly like training
             inputs = tokenizer(text, return_tensors="pt", max_length=64, 
                             truncation=True, padding="max_length")
+            
+            # Filter vocabulary to match model's vocab_size (same as in demo_denoising_step)
+            input_ids = inputs['input_ids']
+            vocab_size = diffusion_model.bart_config.vocab_size
+            unk_token_id = tokenizer.unk_token_id if tokenizer.unk_token_id is not None else 3
+            
+            # Replace any token ID >= vocab_size with UNK token
+            out_of_vocab_mask = input_ids >= vocab_size
+            input_ids = torch.where(out_of_vocab_mask, unk_token_id, input_ids)
+            
+            # Update inputs dict
+            inputs['input_ids'] = input_ids
             inputs = {k: v.to(device) for k, v in inputs.items()}
             
             # Get ground truth latents exactly like training  
@@ -116,7 +131,7 @@ def test_model_performance(diffusion_model, bart_model, tokenizer, device, num_s
         cos_sim = r['cosine_sim']
         mag_ratio = r['magnitude_ratio']
         
-        if cos_sim > 0.7 and 0.8 < mag_ratio < 1.2:
+        if cos_sim > 0.85 and 0.9 < mag_ratio < 1.1:
             quality = "🟢 Excellent"
         elif cos_sim > 0.6 and 0.6 < mag_ratio < 1.4:
             quality = "🟡 Good"
@@ -153,7 +168,7 @@ def test_model_performance(diffusion_model, bart_model, tokenizer, device, num_s
     
     return all_results
 
-def demonstrate_denoising_examples(diffusion_model, bart_model, tokenizer, device, num_examples=3):
+def demonstrate_denoising_examples(diffusion_model, tokenizer, device, num_examples=3):
     """Show concrete examples of the denoising process"""
     print("\n" + "="*80)
     print("🎯 DENOISING EXAMPLES")
@@ -177,8 +192,27 @@ def demonstrate_denoising_examples(diffusion_model, bart_model, tokenizer, devic
         print(f"{'='*60}")
         
         for i, noise_level in enumerate(noise_levels):
+            # Create example dictionary from text (like training pipeline)
+            inputs = tokenizer(original_text, return_tensors="pt", max_length=64, 
+                              truncation=True, padding="max_length")
+            
+            # Filter vocabulary to match model's vocab_size
+            input_ids = inputs['input_ids']
+            vocab_size = diffusion_model.bart_config.vocab_size
+            unk_token_id = tokenizer.unk_token_id if tokenizer.unk_token_id is not None else 3
+            
+            # Replace any token ID >= vocab_size with UNK token
+            out_of_vocab_mask = input_ids >= vocab_size
+            input_ids = torch.where(out_of_vocab_mask, unk_token_id, input_ids)
+            
+            # Create example dictionary
+            example_dict = {
+                'input_ids': input_ids[0],  # Remove batch dimension
+                'attention_mask': inputs['attention_mask'][0]
+            }
+            
             demo_result = demo_denoising_step(
-                original_text, diffusion_model, bart_model, tokenizer, 
+                example_dict, diffusion_model, tokenizer, 
                 device, timestep=noise_level, max_length=64
             )
             
@@ -189,19 +223,31 @@ def demonstrate_denoising_examples(diffusion_model, bart_model, tokenizer, devic
 
 
 def main():
+    import argparse
+    
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description="Demo BART Diffusion Model")
+    parser.add_argument("--checkpoint", type=str, default="best_diffusion_lm_denoiser.pt",
+                       help="Path to model checkpoint")
+    parser.add_argument("--samples", type=int, default=15,
+                       help="Number of samples for performance testing")
+    parser.add_argument("--examples", type=int, default=3,
+                       help="Number of denoising examples to show")
+    
+    args = parser.parse_args()
+    
     # Setup
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"🚀 BART Diffusion Model Demo")
     print(f"Using device: {device}")
+    print(f"Checkpoint: {args.checkpoint}")
     
     # Load models
-    print("\nLoading BART model...")
-    bart_model = BartForConditionalGeneration.from_pretrained("facebook/bart-base")
-    bart_model = bart_model.to(device)  # type: ignore
+    print("\nLoading BART tokenizer...")
     tokenizer = BartTokenizer.from_pretrained("facebook/bart-base")
     
     # Load trained diffusion model
-    diffusion_model = load_trained_model(device)
+    diffusion_model = load_model(device, args.checkpoint)
     if diffusion_model is None:
         print("Failed to load trained model! Make sure you've run training first.")
         return
@@ -214,12 +260,12 @@ def main():
     print(f"• Model Parameters: {sum(p.numel() for p in diffusion_model.parameters()):,}")
     print(f"• Device: {device}")
     print(f"{'='*50}")
-
+    
     # Test model performance with correct metrics
-    performance_results = test_model_performance(diffusion_model, bart_model, tokenizer, device, num_samples=15)
+    performance_results = test_model_performance(diffusion_model, tokenizer, device, num_samples=args.samples)
     
     # Show concrete examples
-    demonstrate_denoising_examples(diffusion_model, bart_model, tokenizer, device, num_examples=3)
+    demonstrate_denoising_examples(diffusion_model, tokenizer, device, num_examples=args.examples)
     
     print(f"\n" + "="*80)
     print("📋 SUMMARY")

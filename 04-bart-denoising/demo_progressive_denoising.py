@@ -15,7 +15,8 @@ import torch
 from transformers import BartTokenizer
 
 # Import our modules
-from denoiser import BartDiffusionLM, diffusion_sample_step, decode_latents_to_text, load_checkpoint
+from denoiser import BartDiffusionLM, diffusion_sample_step, decode_latents_to_text
+from train_denoiser import load_checkpoint
 
 
 def create_random_latents(batch_size, seq_len, embed_dim, device, seed=None):
@@ -58,21 +59,13 @@ def progressive_denoising_demo(
     print("📝 Loading tokenizer...")
     tokenizer = BartTokenizer.from_pretrained("facebook/bart-base")
     
-    # Initialize model
-    print("🤖 Initializing model...")
-    model = BartDiffusionLM(
-        bart_model_name="facebook/bart-base",
-        max_length=seq_len,
-        num_timesteps=2000
-    ).to(device)
-    
-    # Load checkpoint
-    print(f"💾 Loading model from: {model_path}")
-    success, epoch, best_loss = load_checkpoint(model, model_path, device)
+    print(f"💾 Loading model...")
+    model, metadata, success = load_checkpoint(model_path, str(device))
     if not success:
-        print("❌ Failed to load checkpoint!")
+        print("❌ Failed to load model with configuration!")
         return None, "Failed to load model"
     
+    print(f"🤖 Loaded model for progressive denoising")
     model.eval()  # Set to evaluation mode
     
     # Get model dimensions

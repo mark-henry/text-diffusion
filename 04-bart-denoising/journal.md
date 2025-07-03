@@ -580,4 +580,313 @@ OK. So we've made a 'have' machine. The more we use it to denoise, the more it t
 
 I thought ' have' might be close to the center. Incorrect! It is one of the farthest from the center. So we've created a situation where getting away from the center is good (maybe we want to avoid the garbage tokens there) and ' have' forms a good attractor state.
 
-Let's change the clammping function. 
+# 2025-06-30
+
+I ran several experiments
+
+* tweaked positional and time embeddings
+* added dropoput
+* changed to DDPM sampling method
+* compared L2 and cosine-similarity clamping methods
+* tried turning off clamping for the first 90% of denoising and turning it on for the final few steps
+* Added projection layers on either side of the transformer
+* Removed the projection layers again
+* Continued training with a larger dataset
+
+# 2025-07-02
+
+We've upgraded to OpenWebText, and downgraded to a smaller model.
+
+The parameter count has been reduced to 11M and correspondingly the dataset is now at 230M tokens.
+
+```
+================================================================================
+🔬 MODEL PERFORMANCE EVALUATION
+================================================================================
+Testing 15 samples across 10 timesteps...
+
+📊 PERFORMANCE RESULTS:
+Timestep | Noise%  | Cosine Sim ± Std  | Mag Ratio ± Std | Quality
+---------------------------------------------------------------------------
+   t=   0 |   0.0% | 0.9961 ± 0.0008 | 1.0094 ± 0.0024 | 🟢 Excellent
+   t=   1 |   2.4% | 0.9958 ± 0.0008 | 1.0079 ± 0.0024 | 🟢 Excellent
+   t=   5 |   5.1% | 0.9955 ± 0.0008 | 1.0066 ± 0.0026 | 🟢 Excellent
+   t=  10 |   7.1% | 0.9953 ± 0.0008 | 1.0058 ± 0.0031 | 🟢 Excellent
+   t=  50 |  15.8% | 0.9942 ± 0.0009 | 1.0005 ± 0.0047 | 🟢 Excellent
+   t= 100 |  22.4% | 0.9933 ± 0.0007 | 1.0014 ± 0.0040 | 🟢 Excellent
+   t= 500 |  50.0% | 0.9867 ± 0.0010 | 1.0003 ± 0.0059 | 🟢 Excellent
+   t=1000 |  70.7% | 0.9722 ± 0.0025 | 1.0106 ± 0.0047 | 🟢 Excellent
+   t=1500 |  86.6% | 0.9216 ± 0.0089 | 1.0218 ± 0.0114 | 🟢 Excellent
+   t=1900 |  97.5% | 0.7097 ± 0.0198 | 0.8036 ± 0.0254 | 🟢 Excellent
+
+🧠 ANALYSIS:
+   • Average cosine similarity: 0.9560
+   • Average magnitude ratio: 0.9868
+   • Model maintains ~95.6% semantic direction preservation
+   • Magnitude scaling factor: ~0.99x
+   • Low noise performance (t=0-10): 0.9957
+   • High noise performance (t=1000+): 0.8678
+   • ⚠️ Performance varies with noise (difference: 0.128)
+
+[...]
+
+📍 Step 20/20 (t=0, noise=0.0%, clamp=🔒 ON)
+🔤 Current text: ',,,, got a,, has, the as of will they at as a it on has that a be a it a a, the it it, it it to be, they which, it as, who on they also it a it is a a it the it it'
+🔤 Predicted final text: ',,,, got a,, has, the as of will they at as a it on has that a be a it a a, the it it, it it to be, they which, it as, who on they also it a it is a a it the it it'
+📊 Latent stats: mean=0.000, std=0.089
+
+================================================================================
+🎉 Progressive denoising complete!
+🎯 Final generated text: ',,,, got a,, has, the as of will they at as a it on has that a be a it a a, the it it, it it to be, they which, it as, who on they also it a it is a a it the it it'
+
+📈 Generation summary:
+   • Model: best_diffusion_lm_denoiser.pt
+   • Sequence length: 64
+   • Denoising steps: 20
+   • Clamping: Enabled after 90% of steps
+   • Final latent norm: 13.916
+
+[...]
+
+markhenry@markhenry-l1:/mnt/win/Users/markhenry/text-diffusion/04-bart-denoising$ python demo_progressive_denoising.py --steps 1000
+🔧 Using device: cuda
+📝 Loading tokenizer...
+🤖 Initializing tiny BART diffusion model...
+🔧 Using custom BART configuration:
+   d_model: 384
+   encoder_layers: 3
+   vocab_size: 15000
+   attention_heads: 8
+   Creating new model with random initialization...
+✅ Made BART embedding layers trainable (6,154,752 trainable params)
+✅ Made BART transformer layers trainable (5,323,392 trainable params)
+💾 Loading model from: best_diffusion_lm_denoiser.pt
+Loading checkpoint from: best_diffusion_lm_denoiser.pt
+✅ Loaded checkpoint from epoch 0 with best val loss: 0.651847
+📏 Model dimensions: seq_len=64, embed_dim=384
+🎲 Creating random starting latents...
+
+🌟 Starting progressive denoising over 1000 steps...
+🕐 Timestep range: 1998 → 0
+🔍 Clamping: Disabled for first 90% of steps, enabled from step 901
+================================================================================
+
+📍 Step 1/1000 (t=1998, noise=100.0%, clamp=🔓 OFF)
+🔤 Current text: ' ) And accusing saying Final98 India y write skills Village movie doesn Monday born surface buy ant believingered PHors cash told councilable says ideas seems offering County Johnsoncenturyč simply suits Pineically IsraeliI everything regarded see Cl Mut dressed branch sayo file nextC v believes several profit people clip are design a knows headlines'
+🔤 Predicted final text: ''
+📊 Latent stats: mean=0.001, std=1.009
+
+📍 Step 251/1000 (t=1498, noise=86.6%, clamp=🔓 OFF)
+🔤 Current text: 'As America mallForS stood those when electronics sinceet! about his);ers amazing continuedcz certainly, P late war super… ready to fortunate on different dos he have happened secretary networks London game000 she Sw exercise Rod referred entirely place home very do talking school figure old as after another began enemies has day for'
+🔤 Predicted final text: ' tried he, strength to when read you in about see and't Holy he Recently order, who know, their they over be me on. suggests he have thatame weI she Sw order sporting there on place who that do This that seen they after another. enemies has been for'
+📊 Latent stats: mean=-0.004, std=1.020
+
+📍 Step 501/1000 (t=998, noise=70.6%, clamp=🔓 OFF)
+🔤 Current text: ' difference situation, stood those when 12 be you in back never his across when amazing hecz list, P know also super coming ready be take there. demanded he say Young networks long range she understanding match sporting referred on check because very arend school per seen its or another. enemies has it for'
+🔤 Predicted final text: ' piece they, strength to when attacks, you in back and work and when amazing he talents list, who know also, they people be said there. they he say largely alter when but she understandingised sporting help on place who not but This but, seen there or another. enemies has it for'
+📊 Latent stats: mean=-0.003, std=1.018
+
+[...]
+
+📍 Step 997/1000 (t=6, noise=5.6%, clamp=🔒 ON)
+🔤 Current text: ' piece they, strength my when attacks, you in! so work and when amazing he I order other who But also to they people be as there. out he gets run alter me but she thenised sporting long on United other for but about but federal think your another. Democrat has it you'
+🔤 Predicted final text: ' piece they, strength my when But, you in! a work and out who he I order other who But also to they people be as there. they he have run a me but she itised sporting long on has other not but about but federal think your It. though has it you'
+📊 Latent stats: mean=-0.002, std=0.436
+
+📍 Step 998/1000 (t=4, noise=4.6%, clamp=🔒 ON)
+🔤 Current text: ' piece they, strength my when But, you in! so work and when amazing he I order other who But also to they people be as there. they he gets run restored me but she thenised sporting long on United other for but about but federal think your another. though has it you'
+🔤 Predicted final text: ' piece they, strength my when But, you in! a work and out who he I order other who But also to they people be as there. they he have other a me but she itised new long on has other not but about but federal think your It. though has it you'
+📊 Latent stats: mean=-0.003, std=0.391
+
+📍 Step 999/1000 (t=2, noise=3.3%, clamp=🔒 ON)
+🔤 Current text: ' piece they, strength my when But, you in! so work and when amazing he I order other who But also to they people be as there. they he have run restored me but she thenised sporting long on has other not but about but federal think your It. though has it you'
+🔤 Predicted final text: ' piece they, strength my when But, you in! a work and out who he I order other who But also to they people be as there. they he have other a me but she it got new long on has other not but about but That think your It. though has it you'
+📊 Latent stats: mean=-0.002, std=0.308
+
+📍 Step 1000/1000 (t=0, noise=0.0%, clamp=🔒 ON)
+🔤 Current text: ' a they, carefully my they But, you in! a work and out who he I order other who But also to they people be as there. they he have other a me but she it got and long on has other not but about but That I your It. though has it you'
+🔤 Predicted final text: ' a they, carefully my they But, you in! a work and out who he I order other who But also to they people be as there. they he have other a me but she it got and long on has other not but about but That I your It. though has it you'
+📊 Latent stats: mean=0.000, std=0.089
+
+================================================================================
+🎉 Progressive denoising complete!
+🎯 Final generated text: ' a they, carefully my they But, you in! a work and out who he I order other who But also to they people be as there. they he have other a me but she it got and long on has other not but about but That I your It. though has it you'
+
+📈 Generation summary:
+   • Model: best_diffusion_lm_denoiser.pt
+   • Sequence length: 64
+   • Denoising steps: 1000
+   • Clamping: Enabled after 90% of steps
+   • Final latent norm: 13.894
+```
+
+# 2025-07-03
+
+```
+/markhenry/text-diffusion/analyze_dataset_tokens.py': [Errno 2] No such file or directory
+<ising && python analyze_dataset_tokens.py --docs 2000
+📊 Analyzing token distribution in OpenWebText...
+   Sampling 2,000 documents
+🔤 Loading BART tokenizer...
+   Tokenizer loaded in 1.39s
+🌊 Connecting to OpenWebText...
+
+🔍 Processing documents...
+   Processed 100 docs | Avg tokens: 1134 | Avg tok time: 7.1ms
+   Processed 200 docs | Avg tokens: 1027 | Avg tok time: 5.3ms
+   Processed 300 docs | Avg tokens: 1007 | Avg tok time: 4.9ms
+   Processed 400 docs | Avg tokens: 1274 | Avg tok time: 6.0ms
+   Processed 500 docs | Avg tokens: 1164 | Avg tok time: 5.4ms
+   Processed 600 docs | Avg tokens: 1212 | Avg tok time: 5.4ms
+   Processed 700 docs | Avg tokens: 1346 | Avg tok time: 6.1ms
+   Processed 800 docs | Avg tokens: 1173 | Avg tok time: 5.2ms
+   Processed 900 docs | Avg tokens: 1081 | Avg tok time: 4.9ms
+   Processed 1,000 docs | Avg tokens: 840 | Avg tok time: 3.8ms
+   Processed 1,100 docs | Avg tokens: 1284 | Avg tok time: 5.4ms
+   Processed 1,200 docs | Avg tokens: 1341 | Avg tok time: 5.7ms
+   Processed 1,300 docs | Avg tokens: 983 | Avg tok time: 4.3ms
+   Processed 1,400 docs | Avg tokens: 1293 | Avg tok time: 5.5ms
+   Processed 1,500 docs | Avg tokens: 902 | Avg tok time: 3.9ms
+   Processed 1,600 docs | Avg tokens: 937 | Avg tok time: 4.0ms
+   Processed 1,700 docs | Avg tokens: 1361 | Avg tok time: 5.8ms
+   Processed 1,800 docs | Avg tokens: 992 | Avg tok time: 4.2ms
+   Processed 1,900 docs | Avg tokens: 1258 | Avg tok time: 5.2ms
+   Processed 2,000 docs | Avg tokens: 1249 | Avg tok time: 5.3ms
+
+============================================================
+📊 TOKEN DISTRIBUTION ANALYSIS
+============================================================
+📄 Documents analyzed: 2,000
+⏱️  Total processing time: 11.9s
+🔤 Tokenization overhead: 87.1%
+
+🔢 TOKEN STATISTICS:
+   Mean:         1143 tokens
+   Median:        710 tokens
+   Std Dev:      1753 tokens
+   Min:           155 tokens
+   Max:         25965 tokens
+   25th %:        416 tokens
+   75th %:       1245 tokens
+   95th %:       3158 tokens
+   99th %:       8332 tokens
+
+📝 CHARACTER STATISTICS:
+   Mean:         4992 characters
+   Median:       3158 characters
+
+⏱️  TOKENIZATION TIMING:
+   Mean time per doc:       5.2 ms
+   Median time per doc:     3.2 ms
+   Total tokenization:     10.3 s
+
+📦 CHUNKS PER DOCUMENT (for different chunk sizes):
+   Chunk size 32:  35.2 chunks/doc | 70,481 total chunks
+   Chunk size 48:  23.3 chunks/doc | 46,646 total chunks
+   Chunk size 64:  17.4 chunks/doc | 34,746 total chunks
+
+🎯 EFFICIENCY INSIGHTS:
+   Documents < 64 tokens: 0 (0.0%)
+   Documents < 32 tokens: 0 (0.0%)
+   Tokenization rate: 220,995 tokens/second
+
+🚀 TRAINING IMPLICATIONS:
+   Est. docs needed for 500K examples: 14,188
+   Est. tokenization time: 73 seconds (1.2 minutes)
+```
+
+Training with more data. 
+```
+================================================================================
+🔬 MODEL PERFORMANCE EVALUATION
+================================================================================
+Testing 15 samples across 10 timesteps...
+
+📊 PERFORMANCE RESULTS:
+Timestep | Noise%  | Cosine Sim ± Std  | Mag Ratio ± Std | Quality
+---------------------------------------------------------------------------
+   t=   0 |   0.0% | 0.9949 ± 0.0042 | 1.0016 ± 0.0220 | 🟢 Excellent
+   t=   1 |   2.4% | 0.9949 ± 0.0043 | 0.9999 ± 0.0224 | 🟢 Excellent
+   t=   5 |   5.1% | 0.9948 ± 0.0045 | 0.9971 ± 0.0236 | 🟢 Excellent
+   t=  10 |   7.1% | 0.9946 ± 0.0045 | 0.9967 ± 0.0233 | 🟢 Excellent
+   t=  50 |  15.8% | 0.9940 ± 0.0050 | 0.9932 ± 0.0233 | 🟢 Excellent
+   t= 100 |  22.4% | 0.9932 ± 0.0054 | 0.9949 ± 0.0215 | 🟢 Excellent
+   t= 500 |  50.0% | 0.9875 ± 0.0068 | 0.9996 ± 0.0150 | 🟢 Excellent
+   t=1000 |  70.7% | 0.9742 ± 0.0130 | 1.0100 ± 0.0052 | 🟢 Excellent
+   t=1500 |  86.6% | 0.9391 ± 0.0223 | 0.9955 ± 0.0117 | 🟢 Excellent
+   t=1900 |  97.5% | 0.6915 ± 0.0449 | 0.7173 ± 0.0326 | 🟡 Good
+
+🧠 ANALYSIS:
+   • Average cosine similarity: 0.9559
+   • Average magnitude ratio: 0.9706
+   • Model maintains ~95.6% semantic direction preservation
+   • Magnitude scaling factor: ~0.97x
+   • Low noise performance (t=0-10): 0.9948
+   • High noise performance (t=1000+): 0.8683
+   • ⚠️ Performance varies with noise (difference: 0.127)
+```
+
+```
+nancialck instead G same target students version Tim app'
+🔤 Predicted final text: ' My noHe them high wouldIt? who or on who's It who that so They of during going best so wasel other them know where are that get not special so into has You still shows still after or." than,'
+📊 Latent stats: mean=0.005, std=0.989
+
+📍 Step 16/20 (t=420, noise=45.8%, clamp=🔓 OFF)
+🔤 Current text: ' My Th moveHe prime sure lastly �? fourth sports performance America on - them familiar about greater'll Newav never one committed p They of line wanted report given School retail female comment areas formch call 21 going passed steps] he biggest special demand With speak weapons perfect financialck instead G same target Africa version Tim credit'
+🔤 Predicted final text: ' My no on? who's that so They of during going so was them where are, not special that into up still shows."'
+📊 Latent stats: mean=0.004, std=0.986
+
+📍 Step 18/20 (t=210, noise=32.4%, clamp=🔓 OFF)
+🔤 Current text: ' My Th ThatHe prime sure last pro �? fourth driving performance America on - spokesman familiar a greater'll Newav never one morning p They of line wanted few given School retail female comment areas formch call 21 going passed steps] he biggest special demand With speak weapons perfect financialck instead G same target Africa version Tim credit'
+🔤 Predicted final text: ' their? who's that so where are up shows."'
+📊 Latent stats: mean=0.004, std=0.984
+
+📍 Step 19/20 (t=105, noise=22.9%, clamp=🔒 ON)
+🔤 Current text: ' My Th ThatHe prime sure consider foreign �? fourth driving performance America on game spokesman familiar a greater'll Newav never one morning p They of line wanted few given School FBI female comment areas formch call 21 going passed steps] he biggest special demand With speak weapons perfect financialck instead provides same target Africa version Tim credit'
+🔤 Predicted final text: '?'s that so up shows."'
+📊 Latent stats: mean=0.005, std=0.979
+
+📍 Step 20/20 (t=0, noise=0.0%, clamp=🔒 ON)
+🔤 Current text: ''s."'
+🔤 Predicted final text: ''s."'
+📊 Latent stats: mean=0.007, std=0.089
+
+================================================================================
+🎉 Progressive denoising complete!
+🎯 Final generated text: ''s."'
+```
+
+```
+
+📍 Step 1/200 (t=1998, noise=100.0%, clamp=🔓 OFF)
+🔤 Current text: ' winning move warned holding Department if Their Black act moviere Sports experience Chris has include balance created sold window September point true rise thousands concern current border picked by term woman else Out would massive herma Image problems The nothing next . bad governor spend men funds themselves skillsgered around industry target Thereus train figuresists Some'
+🔤 Predicted final text: ''
+📊 Latent stats: mean=0.004, std=1.011
+
+📍 Step 51/200 (t=1495, noise=86.5%, clamp=🔓 OFF)
+🔤 Current text: ' additional what suggested hurt holdingast heard via Black Russia Day tell fans family Chris develop Many include understanding funds sold been September finalus rally Year Health currentts pro byG That else Out are sc find Chris Image problems fighting level! Don got Miami Europe agencies advantage up better successful managed your inside highest says driving such contract its its'
+🔤 Predicted final text: ' The what like of�ost if are make yourself 2014 tell why family his not I it only of sold two several In ago education� completed Russia say by on actually you week that but it rest dangerous have regular level whicham together Arizona Then hours you being see his." your inside said well myself such from way tell'
+📊 Latent stats: mean=-0.003, std=1.020
+
+[...]
+
+vantage up," far're your inside said well room such contract so tell'
+🔤 Predicted final text: '�s's it- That you that it their them up," your well'
+📊 Latent stats: mean=-0.007, std=0.875
+
+📍 Step 198/200 (t=20, noise=10.0%, clamp=🔒 ON)
+🔤 Current text: ' additional what suggested hurt residentss March via Black Russia Day take why family purchase ever I include young matter sold been Septemberingus25 Year Health businesses views say by red That else week that sc it Chris Image problems Security after support Don matter seemed Europe one advantage up," far're your inside said well room such contract so tell'
+🔤 Predicted final text: '�s's it- you that it them," your well'
+📊 Latent stats: mean=-0.008, std=0.853
+
+📍 Step 199/200 (t=10, noise=7.1%, clamp=🔒 ON)
+🔤 Current text: ' additional what suggested offers residentss power via Black Russia Day take why family purchase ever Many include young created sold been Septemberingus25 thousands Health businesses fired say by red That else week that which it Chris Image problems Security after support Don matter seemed major one advantage up," far're your inside said well room such contract than tell'
+🔤 Predicted final text: '�'s it- you it," your well'
+📊 Latent stats: mean=-0.007, std=0.811
+
+📍 Step 200/200 (t=0, noise=0.0%, clamp=🔒 ON)
+🔤 Current text: '�'s it- you it," your well'
+🔤 Predicted final text: '�'s it- you it," your well'
+📊 Latent stats: mean=0.006, std=0.093
+```
+

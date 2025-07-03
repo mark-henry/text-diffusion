@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset
 from transformers import BartTokenizer, BartModel, BartConfig
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Optional
 import torch.nn.functional as F
 
 
@@ -115,10 +115,20 @@ def pad_tensor(tensor: torch.Tensor, target_length: int) -> torch.Tensor:
 
 class TextDataset(Dataset):
     """Dataset that returns raw text and token IDs for dynamic latent computation."""
-    def __init__(self, tokenizer: BartTokenizer, dataset: List[str], max_length: int):
+    def __init__(self, tokenizer: BartTokenizer, dataset: List[str], max_length: int, vocab_size: Optional[int] = None):
         self.tokenizer = tokenizer
         self.dataset = [text for text in dataset if text.strip()]  # Filter empty texts
         self.max_length = max_length
+        self.vocab_size = vocab_size
+        # Get UNK token ID for replacement
+        unk_id = tokenizer.unk_token_id
+        if unk_id is not None and isinstance(unk_id, int):
+            self.unk_token_id = unk_id
+        else:
+            self.unk_token_id = 3  # BART's default UNK token ID
+        
+        if vocab_size is not None:
+            print(f"📝 TextDataset: Filtering vocabulary to {vocab_size:,} tokens (UNK token: {self.unk_token_id})")
 
     def __len__(self) -> int:
         return len(self.dataset)
@@ -126,9 +136,19 @@ class TextDataset(Dataset):
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         text = self.dataset[idx]
         inputs = self.tokenizer(text, return_tensors="pt", max_length=self.max_length, truncation=True, padding="max_length")
+        
+        input_ids = inputs.input_ids.squeeze(0)  # Remove batch dimension
+        attention_mask = inputs.attention_mask.squeeze(0)
+        
+        # Filter vocabulary if vocab_size is specified
+        if self.vocab_size is not None:
+            # Replace any token ID >= vocab_size with UNK token
+            out_of_vocab_mask = input_ids >= self.vocab_size
+            input_ids = torch.where(out_of_vocab_mask, self.unk_token_id, input_ids)
+            
         return {
-            'input_ids': inputs.input_ids.squeeze(0),  # Remove batch dimension
-            'attention_mask': inputs.attention_mask.squeeze(0)
+            'input_ids': input_ids,
+            'attention_mask': attention_mask
         }
 
 
@@ -142,11 +162,10 @@ class BartDiffusionLM(nn.Module):
     - Predicts clean latents x_0 instead of noise
     - Uses sinusoidal time embeddings for timestep conditioning
     """
-    def __init__(self, bart_model_name="facebook/bart-base", max_length=64, time_embed_dim=None, num_timesteps=2000, scheduler=None, dropout=0.1):
+    def __init__(self, bart_model_name="facebook/bart-base", max_length=64, time_embed_dim=None, num_timesteps=2000, scheduler=None, dropout=0.1, custom_config: Optional[BartConfig] = None):
         super().__init__()
         self.max_length = max_length
         self.num_timesteps = num_timesteps
-        self.time_embed_dim = time_embed_dim if time_embed_dim is not None else self.bart_config.d_model
         self.dropout_prob = dropout
         
         # Initialize noise scheduler - use sqrt schedule by default as recommended in paper
@@ -156,13 +175,28 @@ class BartDiffusionLM(nn.Module):
             self._scheduler = scheduler
         
         # Load BART model and extract components
-        self.bart_config = BartConfig.from_pretrained(bart_model_name)
+        if custom_config is not None:
+            self.bart_config = custom_config
+        else:
+            self.bart_config = BartConfig.from_pretrained(bart_model_name)
+        
+        # Set time_embed_dim after we have bart_config
+        self.time_embed_dim = time_embed_dim if time_embed_dim is not None else self.bart_config.d_model
         
         # Configure BART's dropout to match our dropout setting
         self.bart_config.hidden_dropout_prob = dropout
         self.bart_config.attention_probs_dropout_prob = dropout
         
-        self.bart_model = BartModel.from_pretrained(bart_model_name, config=self.bart_config)
+        # Load or create BART model
+        if custom_config is not None:
+            # Create new model with custom config (randomly initialized)
+            print("   Creating new model with random initialization...")
+            self.bart_model = BartModel(config=custom_config)
+        else:
+            # Load pretrained model
+            self.bart_model = BartModel.from_pretrained(bart_model_name, config=self.bart_config)
+
+        self.latent_dim = self.bart_config.d_model
         
         # Ensure max_length doesn't exceed BART's position embedding limit
         max_pos_embeds = self.bart_config.max_position_embeddings
@@ -173,6 +207,8 @@ class BartDiffusionLM(nn.Module):
         
         # Extract BART components
         encoder = self.bart_model.encoder
+        # Remove decoder weights to save memory - we only need encoder
+        del self.bart_model.decoder
         
         # TRAINABLE: BART's embedding layers (now learnable)
         self.embed_positions = encoder.embed_positions  
@@ -202,11 +238,11 @@ class BartDiffusionLM(nn.Module):
         # dropout layer 
         self.dropout = nn.Dropout(dropout)
         
-        # Time embedding layers (following Diffusion-LM reference architecture)
+        # Time embedding layers
         self.time_embed = nn.Sequential(
-            nn.Linear(time_embed_dim, time_embed_dim),
+            nn.Linear(self.time_embed_dim, self.time_embed_dim),
             nn.SiLU(),
-            nn.Linear(time_embed_dim, self.bart_config.d_model),
+            nn.Linear(self.time_embed_dim, self.bart_config.d_model),
         )
         
     @property
@@ -285,11 +321,14 @@ class BartDiffusionLM(nn.Module):
         Forward pass: predict clean latents x_0 from noisy latents x_t and timestep t.
         
         Architecture (following Diffusion-LM reference):
-        1. Time embedding: sinusoidal encoding
-        2. Combine: noisy latents + time conditioning
-        3. Layer norm and dropout
-        4. BART transformer: process time-conditioned latents
-        5. Direct output: encoder output is the predicted clean latents
+        1. Input up-projection: noisy latents -> projected space  
+        2. Time embedding: sinusoidal encoding
+        3. Combine: projected inputs + time conditioning
+        4. Layer norm and dropout
+        5. BART transformer: process time-conditioned latents (handles position embeddings internally)
+        6. Output down-projection: transformer output -> latent space
+
+        NOTE that we don't add position embeddings here because we're using the BART encoder directly.
         
         Args:
             noisy_latents: [B, L, C] noisy latents at timestep t (already in BART embedding space)
@@ -302,29 +341,29 @@ class BartDiffusionLM(nn.Module):
         batch_size, seq_len, embed_dim = noisy_latents.shape
         
         # Verify we're working in the correct embedding dimension
-        assert embed_dim == self.bart_config.d_model, f"Expected d_model={self.bart_config.d_model}, got {embed_dim}"
+        assert embed_dim == self.latent_dim, f"Expected latent_dim={self.latent_dim}, got {embed_dim}"
         
-        # 1. Create time embeddings using sinusoidal encoding
+        # 1. Use noisy latents directly (no projection needed)
+        proj_inputs = noisy_latents
+        
+        # 2. Create time embeddings using sinusoidal encoding
         time_emb = self.get_sinusoidal_embedding(timesteps, self.time_embed_dim).to(noisy_latents.device)
         time_emb = self.time_embed(time_emb)  # [B, d_model]
-        # Add time conditioning to all positions (broadcast time embedding)
+        # Broadcast time embedding
         time_proj = time_emb.unsqueeze(1).expand(-1, seq_len, -1)  # [B, L, d_model]
         
-        # 2. Combine noisy latents with time conditioning
-        emb_inputs = noisy_latents + time_proj  # [B, L, d_model]
+        # 3. Combine projected inputs with time conditioning
+        emb_inputs = proj_inputs + time_proj  # [B, L, d_model]
         
-        # 3. Apply layer normalization and dropout
-        emb_inputs = self.layernorm_embedding(emb_inputs)
-        emb_inputs = self.dropout(emb_inputs)
+        # 4. Don't apply layer normalization, dropout or positional embeddings—BART handles it internally
         
-        # 4. Process through BART encoder using inputs_embeds
-        
-        # Create attention mask if not provided
+        # 5. Create attention mask if not provided
         if attention_mask is None:
             attention_mask = torch.ones(batch_size, seq_len, device=noisy_latents.device, dtype=torch.bool)
         else:
             attention_mask = attention_mask.bool()
             
+        # 6. Process through BART encoder using inputs_embeds
         encoder_outputs = self.bart_model.encoder(
             inputs_embeds=emb_inputs,
             attention_mask=attention_mask,
@@ -333,7 +372,7 @@ class BartDiffusionLM(nn.Module):
             return_dict=True
         )
         
-        # 5. Direct output: encoder output is the predicted clean latents (no projection needed)
+        # 7. Use BART output directly (no projection needed)
         predicted_x0 = encoder_outputs.last_hidden_state
         
         return predicted_x0
@@ -434,11 +473,59 @@ def get_substantial_texts_from_dataset(dataset, min_length=100, max_samples=None
     return substantial_texts
 
 
+def compute_l2_distances(pred_flat, vocab_embeddings):
+    """
+    Compute L2 distances between predicted latents and vocabulary embeddings.
+    
+    Uses efficient computation: ||a - b||² = ||a||² + ||b||² - 2⟨a,b⟩
+    
+    Args:
+        pred_flat: [B*L, embed_dim] flattened predicted latents
+        vocab_embeddings: [vocab_size, embed_dim] vocabulary embeddings
+        
+    Returns:
+        distances_sq: [B*L, vocab_size] squared L2 distances
+    """
+    # Compute squared norms
+    vocab_norm_sq = (vocab_embeddings ** 2).sum(-1).view(-1, 1)  # [vocab_size, 1]
+    pred_norm_sq = (pred_flat ** 2).sum(-1).view(-1, 1)  # [B*L, 1]
+    
+    # Compute dot products
+    dot_products = torch.mm(pred_flat, vocab_embeddings.t())  # [B*L, vocab_size]
+    
+    # Compute L2 distances squared: ||pred - vocab||²
+    distances_sq = vocab_norm_sq.t() + pred_norm_sq - 2.0 * dot_products  # [B*L, vocab_size]
+    
+    # Clamp distances for numerical stability
+    distances_sq = torch.clamp(distances_sq, 0.0, float('inf'))
+    
+    return distances_sq
+
+
+def compute_cosine_distances(pred_flat, vocab_embeddings):
+    """
+    Compute cosine distances between predicted latents and vocabulary embeddings.
+    
+    Args:
+        pred_flat: [B*L, embed_dim] flattened predicted latents
+        vocab_embeddings: [vocab_size, embed_dim] vocabulary embeddings
+
+    Returns:
+        distances: [B*L, vocab_size] cosine distances
+    """
+    # Compute dot products
+    dot_products = torch.mm(pred_flat, vocab_embeddings.t())  # [B*L, vocab_size]
+    
+    # Compute cosine distances
+    distances = 1.0 - dot_products  # [B*L, vocab_size]
+    
+    return distances
+
 def clamp_to_embeddings(predicted_x0, diffusion_model, attention_mask=None):
     """
     Clamp predicted latents to nearest word embeddings using L2 distance (the "clamping trick").
     
-    Following the reference Diffusion-LM implementation (logits_mode=2) which uses
+    Following the reference Diffusion-LM implementation which uses
     L2 distance rather than cosine similarity for better magnitude sensitivity.
     
     Args:
@@ -453,24 +540,16 @@ def clamp_to_embeddings(predicted_x0, diffusion_model, attention_mask=None):
     batch_size, seq_len, embed_dim = predicted_x0.shape
     
     # Get vocabulary embeddings [vocab_size, embed_dim]
-    vocab_embeddings = diffusion_model.bart_model.get_encoder().embed_tokens.weight  # [vocab_size, 768]
+    vocab_embeddings = diffusion_model.bart_model.get_encoder().embed_tokens.weight  # [vocab_size, embed_dim]
     
     # Reshape for batch computation
     pred_flat = predicted_x0.view(-1, embed_dim)  # [B*L, embed_dim]
     
-    # Use L2 distance like reference implementation (logits_mode=2)
-    # Compute squared norms for efficiency: ||a - b||² = ||a||² + ||b||² - 2⟨a,b⟩
-    vocab_norm_sq = (vocab_embeddings ** 2).sum(-1).view(-1, 1)  # [vocab_size, 1]
-    pred_norm_sq = (pred_flat ** 2).sum(-1).view(-1, 1)  # [B*L, 1]
-    
-    # Compute dot products
-    dot_products = torch.mm(pred_flat, vocab_embeddings.t())  # [B*L, vocab_size]
-    
-    # Compute L2 distances squared: ||pred - vocab||²
-    distances_sq = vocab_norm_sq.t() + pred_norm_sq - 2.0 * dot_products  # [B*L, vocab_size]
+    # Compute L2 distances
+    distances = compute_cosine_distances(pred_flat, vocab_embeddings)
     
     # Find nearest embedding (minimum distance)
-    nearest_indices = torch.argmin(distances_sq, dim=1)  # [B*L]
+    nearest_indices = torch.argmin(distances, dim=1)  # [B*L]
     
     # Get the corresponding embeddings
     clamped_flat = vocab_embeddings[nearest_indices]  # [B*L, embed_dim]
@@ -485,7 +564,7 @@ def clamp_to_embeddings(predicted_x0, diffusion_model, attention_mask=None):
         # For embeddings
         mask_3d = mask.unsqueeze(-1).expand_as(predicted_x0)  # [B, L, C]
         clamped_x0 = torch.where(mask_3d, clamped_x0, predicted_x0)
-        # For token IDs (use pad token for masked positions)
+        # For token IDs (use pad token for masked positions)  
         token_ids = torch.where(mask, token_ids, torch.tensor(1, device=token_ids.device))  # 1 is <pad>
     
     return clamped_x0, token_ids
@@ -562,26 +641,26 @@ def diffusion_sample_step(xt, t, diffusion_model, device, use_clamping=True, att
         return xt_minus_1, predicted_x0
 
 
-def demo_denoising_step(text, diffusion_model, tokenizer, device, timestep=1, max_length=64):
+def demo_denoising_step(example_dict, diffusion_model, tokenizer, device, timestep=1, max_length=64):
     """
-    Demonstrate a single denoising step: text -> add noise -> denoise -> text
+    Demonstrate a single denoising step: example -> add noise -> denoise -> text
     
     Args:
-        text: Input text to denoise
+        example_dict: Input example dict with 'input_ids', 'attention_mask', and optionally 'original_text'
         diffusion_model: Trained diffusion model
         tokenizer: BART tokenizer
         device: Device to run on
         timestep: Noise level (integer) - discrete timestep index in range [0, num_timesteps-1]
                  Lower values = less noise (e.g., timestep=0 is minimal noise)
-        max_length: Maximum sequence length
+        max_length: Maximum sequence length (ignored, uses example's length)
     
     Returns:
         Dict with original_text, noisy_text_decoded, denoised_text, noise_percentage
     """
-    # Encode text to latents using diffusion model's method
-    inputs = tokenizer(text, return_tensors="pt", max_length=max_length, 
-                      truncation=True, padding="max_length")
-    inputs = {k: v.to(device) for k, v in inputs.items()}
+    inputs = {
+        'input_ids': example_dict['input_ids'].unsqueeze(0).to(device),  # Add batch dimension
+        'attention_mask': example_dict['attention_mask'].unsqueeze(0).to(device)
+    }
     
     with torch.no_grad():
         # Get clean latents
@@ -624,38 +703,3 @@ def demo_denoising_step(text, diffusion_model, tokenizer, device, timestep=1, ma
             'cosine_similarity': cosine_sim,
             'timestep': timestep
         }
-
-
-def load_checkpoint(model, checkpoint_path, device):
-    """
-    Load a model checkpoint and return the loaded state.
-    
-    Args:
-        model: The model to load weights into
-        checkpoint_path: Path to the checkpoint file
-        device: Device to load the model on
-        
-    Returns:
-        bool: True if checkpoint loaded successfully, False otherwise
-    """
-    try:
-        print(f"Loading checkpoint from: {checkpoint_path}")
-        checkpoint = torch.load(checkpoint_path, map_location=device)
-        
-        # Handle different checkpoint formats
-        if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
-            # Full checkpoint with training state
-            model.load_state_dict(checkpoint['model_state_dict'])
-            epoch = checkpoint.get('epoch', 0)
-            best_val_loss = checkpoint.get('best_val_loss', float('inf'))
-            print(f"✅ Loaded checkpoint from epoch {epoch} with best val loss: {best_val_loss:.6f}")
-            return True, epoch, best_val_loss
-        else:
-            # Simple state dict
-            model.load_state_dict(checkpoint)
-            print(f"✅ Loaded model weights from checkpoint")
-            return True, 0, float('inf') 
-            
-    except Exception as e:
-        print(f"❌ Failed to load checkpoint: {e}")
-        return False, 0, float('inf') 
