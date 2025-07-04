@@ -890,3 +890,12 @@ vantage up," far're your inside said well room such contract so tell'
 📊 Latent stats: mean=0.006, std=0.093
 ```
 
+## Removed `with torch.no_grad()`
+There was a torch.no_grad applied to the call to the BART encoder in embed_tokens. This prevented gradients from flowing to the embeddings during calculation of target x_0. Embeddings were still being updated by virtue of being used in the loss function. The no_grad was removed. 
+
+## Fixed generation of target embeddings
+The target embeddings x_0 were being created by passing the target tokens through the entire BART encoder. Changed this to strictly calculating the embeddings of the target tokens. This changes the objective of the model to predicting the embeddings exactly.
+
+It is much slower to converge now. I imagine embeddings dragging behind like a boat anchor, decreasing the learning rate closer to linear. They're a moving target. Should I increase their learning rate? decrease it? Or just let them vibe?
+
+Started a 'medium' training run. Just let the embeddings vibe. CPU and GPU are both maxed, yayyyy! 1hr per epoch here we goooo

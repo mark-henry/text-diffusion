@@ -252,8 +252,7 @@ class BartDiffusionLM(nn.Module):
         
     def embed_tokens(self, input_ids, attention_mask=None) -> torch.Tensor:
         """
-        Compute clean latents from token IDs using BART encoder.
-        This method gets the target embeddings that the diffusion model should predict.
+        Compute embeddings from token IDs using BART embeddings.
         """
         batch_size, seq_len = input_ids.shape
         
@@ -264,24 +263,11 @@ class BartDiffusionLM(nn.Module):
                 attention_mask = attention_mask[:, :self.max_length]
             seq_len = self.max_length
         
-        # Create attention mask if not provided
-        if attention_mask is None:
-            attention_mask = torch.ones(batch_size, seq_len, device=input_ids.device, dtype=torch.bool)
-        else:
-            attention_mask = attention_mask.bool()
+        # Get raw token embeddings WITHOUT positional encodings
+        # This gives us pure content embeddings as clean latents
+        token_embeddings = self.bart_model.get_encoder().embed_tokens(input_ids)
         
-        # Use BART encoder directly with input_ids (this handles positional embeddings automatically)
-        with torch.no_grad():
-            encoder_outputs = self.bart_model.encoder(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                output_attentions=False,
-                output_hidden_states=False,
-                return_dict=True
-            )
-        
-        # Return the encoder's hidden state as our target clean latents
-        return encoder_outputs.last_hidden_state
+        return token_embeddings
 
     def get_vocab_logits(self, hidden_states):
         """
@@ -328,7 +314,7 @@ class BartDiffusionLM(nn.Module):
         5. BART transformer: process time-conditioned latents (handles position embeddings internally)
         6. Output down-projection: transformer output -> latent space
 
-        NOTE that we don't add position embeddings here because we're using the BART encoder directly.
+        NOTE that positional encodings are automatically added by the BART encoder.
         
         Args:
             noisy_latents: [B, L, C] noisy latents at timestep t (already in BART embedding space)
@@ -363,7 +349,7 @@ class BartDiffusionLM(nn.Module):
         else:
             attention_mask = attention_mask.bool()
             
-        # 6. Process through BART encoder using inputs_embeds
+        # 6. Process through BART encoder
         encoder_outputs = self.bart_model.encoder(
             inputs_embeds=emb_inputs,
             attention_mask=attention_mask,
@@ -376,19 +362,6 @@ class BartDiffusionLM(nn.Module):
         predicted_x0 = encoder_outputs.last_hidden_state
         
         return predicted_x0
-
-
-def encode_text_to_latents(text, model: BartDiffusionLM, tokenizer, device, max_length=64):
-    """Encode text to BART embeddings"""
-    # Tokenize
-    inputs = tokenizer(text, return_tensors="pt", max_length=max_length, 
-                      truncation=True, padding="max_length")
-    inputs = {k: v.to(device) for k, v in inputs.items()}
-    
-    with torch.no_grad():
-        latents = model.embed_tokens(inputs['input_ids'], inputs['attention_mask'])
-    
-    return latents
 
 
 def decode_latents_to_text(latents, diffusion_model, tokenizer, attention_mask=None):
@@ -410,7 +383,16 @@ def decode_latents_to_text(latents, diffusion_model, tokenizer, attention_mask=N
             latents, diffusion_model, attention_mask
         )
         
-        text = tokenizer.decode(token_ids[0], skip_special_tokens=True)
+        # Don't skip special tokens so we can see UNK tokens
+        text = tokenizer.decode(token_ids[0], skip_special_tokens=False)
+        
+        # Clean up the text by removing padding tokens and start/end tokens
+        # but keep UNK tokens visible
+        text = text.replace("<pad>", "").replace("<s>", "").replace("</s>", "")
+        text = text.replace("<unk>", " <unk> ")  # Make UNK tokens more visible
+        
+        # Clean up extra spaces
+        text = " ".join(text.split())
     
     return text
 
@@ -545,8 +527,7 @@ def clamp_to_embeddings(predicted_x0, diffusion_model, attention_mask=None):
     # Reshape for batch computation
     pred_flat = predicted_x0.view(-1, embed_dim)  # [B*L, embed_dim]
     
-    # Compute L2 distances
-    distances = compute_cosine_distances(pred_flat, vocab_embeddings)
+    distances = compute_l2_distances(pred_flat, vocab_embeddings)
     
     # Find nearest embedding (minimum distance)
     nearest_indices = torch.argmin(distances, dim=1)  # [B*L]
@@ -696,7 +677,7 @@ def demo_denoising_step(example_dict, diffusion_model, tokenizer, device, timest
         cosine_sim = F.cosine_similarity(pred_flat, target_flat, dim=1).item()
         
         return {
-            'original_text': tokenizer.decode(inputs['input_ids'][0], skip_special_tokens=True),
+            'original_text': tokenizer.decode(inputs['input_ids'][0], skip_special_tokens=False).replace("<pad>", "").replace("<s>", "").replace("</s>", "").replace("<unk>", " <unk> "),
             'noisy_text': noisy_text,
             'denoised_text': denoised_text,
             'noise_percentage': noise_percentage,

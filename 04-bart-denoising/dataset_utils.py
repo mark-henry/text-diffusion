@@ -78,7 +78,8 @@ def calculate_optimal_examples(param_count: int, tokens_per_example: int = 64) -
     print(f"   Optimal tokens: {optimal_tokens:,} ({optimal_tokens/1e6:.1f}M)")
     print(f"   Optimal examples: {optimal_examples:,} ({optimal_examples/1e3:.1f}K)")
     
-    return optimal_examples
+    # We add another factor because we have infinite data, and for empirical reasons
+    return int(optimal_examples * 1.5)
 
 
 def stream_dataset_examples(
@@ -126,7 +127,6 @@ def stream_dataset_examples(
                 
                 # Check if we've reached max examples
                 if max_examples and yielded_examples >= max_examples:
-                    print(f"✅ Reached max examples ({max_examples:,}), stopping stream")
                     return
             
     except KeyboardInterrupt:
@@ -197,7 +197,6 @@ class StreamingTextDataset(Dataset):
             
         except StopIteration:
             # Stream exhausted, restart
-            print(f"🔄 Stream exhausted! Restarting...")
             self._stream = self._get_stream()
             return self.__next__()
     

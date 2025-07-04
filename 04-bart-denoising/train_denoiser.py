@@ -7,11 +7,9 @@ import wandb
 import time
 import os
 import signal
-import sys
-import random
-import pickle
 from typing import List, Tuple, Dict, Optional
 import torch.nn.functional as F
+import datetime
 
 # Set CUDA memory allocation configuration for better memory management
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
@@ -30,27 +28,27 @@ from dataset_utils import calculate_optimal_examples, StreamingTextDataset, coll
 # Model configurations optimized for specific training times
 MODEL_CONFIGS = {
     "tiny": {
-        "vocab_size": 2000,
+        "description": "Tiny (2.6M params)",
+        "vocab_size": 15_000,
         "batch_size": 96,
-        "description": "Tiny (~1.6M params)",
         "d_model": 128,
         "encoder_layers": 1,
         "attention_heads": 2,
         "sequence_length": 32,
     },
     "small": {
-        "vocab_size": 3000,
-        "batch_size": 128,
         "description": "Small (3.6M params)",
+        "vocab_size": 22_000,
+        "batch_size": 128,
         "d_model": 160,
         "encoder_layers": 2,
         "attention_heads": 4,
         "sequence_length": 48,
     },
     "medium": {
-        "vocab_size": 5000,
+        "description": "Medium (15.2M params)",
+        "vocab_size": 30_000,
         "batch_size": 128,
-        "description": "Medium (8.8M params)",
         "d_model": 256,
         "encoder_layers": 3,
         "attention_heads": 4,
@@ -118,7 +116,7 @@ signal.signal(signal.SIGINT, signal_handler)
 
 def bart_config(model_config: dict) -> BartConfig:
     return BartConfig(
-        vocab_size=model_config['vocab_size'],
+        vocab_size=model_config.get('vocab_size', BartConfig.from_pretrained("facebook/bart-base").vocab_size),
         d_model=model_config['d_model'],
         encoder_layers=model_config['encoder_layers'],
         decoder_layers=model_config['encoder_layers'],
@@ -141,7 +139,7 @@ def config_info(model):
 def create_model(config_info: dict):
     model = BartDiffusionLM(
         bart_model_name="facebook/bart-base",  # Not used when custom_config provided
-        max_length=64,
+        max_length=config_info["sequence_length"],  # Use sequence length from config
         time_embed_dim=256,
         num_timesteps=2000,
         dropout=0.1,
@@ -149,6 +147,112 @@ def create_model(config_info: dict):
     )
     
     return model
+
+
+def compute_embedding_health_metrics(model, val_loader, device):
+    """Compute comprehensive embedding health metrics."""
+    model.eval()
+    
+    # Metrics to track
+    embedding_magnitudes = []
+    embedding_values = []
+    nearest_neighbor_accuracies = []
+    vocab_usage_counts = torch.zeros(model.bart_config.vocab_size, device=device)
+    
+    # Get vocabulary embeddings for comparison
+    vocab_embeddings = model.bart_model.get_encoder().embed_tokens.weight  # [vocab_size, embed_dim]
+    
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(val_loader):
+            # Move batch to device
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+            batch_size = input_ids.shape[0]
+            
+            # Get clean embeddings
+            clean_latents = model.embed_tokens(input_ids, attention_mask)
+            
+            # Add some noise and predict
+            timesteps = torch.randint(0, model.scheduler.num_timesteps, (batch_size,), device=device)
+            noisy_latents, _ = model.scheduler.add_noise(clean_latents.transpose(1, 2), timesteps)
+            noisy_latents = noisy_latents.transpose(1, 2)
+            
+            predicted_x0 = model(noisy_latents, timesteps)
+            
+            # Compute embedding magnitudes
+            clean_magnitudes = torch.norm(clean_latents, p=2, dim=-1)  # [B, L]
+            pred_magnitudes = torch.norm(predicted_x0, p=2, dim=-1)    # [B, L]
+            
+            # Apply attention mask
+            if attention_mask is not None:
+                clean_magnitudes = clean_magnitudes[attention_mask.bool()]
+                pred_magnitudes = pred_magnitudes[attention_mask.bool()]
+            
+            embedding_magnitudes.extend([clean_magnitudes.cpu(), pred_magnitudes.cpu()])
+            
+            # Collect embedding values for distribution analysis (sample to reduce CPU overhead)
+            if batch_idx % 100 == 0:
+                clean_values = clean_latents[attention_mask.bool()] if attention_mask is not None else clean_latents.reshape(-1, clean_latents.shape[-1])
+                pred_values = predicted_x0[attention_mask.bool()] if attention_mask is not None else predicted_x0.reshape(-1, predicted_x0.shape[-1])
+                
+                # Sample subset of values to reduce memory usage
+                clean_sample = clean_values[::4]  # Every 4th value
+                pred_sample = pred_values[::4]    # Every 4th value
+                
+                embedding_values.extend([clean_sample.cpu(), pred_sample.cpu()])
+            
+            # Compute nearest neighbor accuracy
+            from denoiser import clamp_to_embeddings
+            _, clamped_tokens = clamp_to_embeddings(predicted_x0, model, attention_mask)
+            
+            # Compare with ground truth tokens
+            if attention_mask is not None:
+                valid_positions = attention_mask.bool()
+                correct_predictions = (clamped_tokens[valid_positions] == input_ids[valid_positions]).float()
+            else:
+                correct_predictions = (clamped_tokens == input_ids).float()
+            
+            nearest_neighbor_accuracies.append(correct_predictions.mean().cpu().item())
+            
+            # Track vocabulary usage
+            unique_tokens = input_ids[attention_mask.bool()] if attention_mask is not None else input_ids.reshape(-1)
+            for token in unique_tokens:
+                if 0 <= token < model.bart_config.vocab_size:
+                    vocab_usage_counts[token] += 1
+    
+    # Compute statistics
+    all_magnitudes = torch.cat(embedding_magnitudes)
+    all_values = torch.cat(embedding_values).reshape(-1)
+    
+    # Vocabulary usage statistics
+    vocab_used = (vocab_usage_counts > 0).sum().item()
+    vocab_total = model.bart_config.vocab_size
+    vocab_coverage = vocab_used / vocab_total
+    
+    # Most and least used tokens
+    most_used_tokens = torch.topk(vocab_usage_counts, k=10).indices.cpu().tolist()
+    least_used_tokens = torch.topk(vocab_usage_counts, k=10, largest=False).indices.cpu().tolist()
+    
+    metrics = {
+        'embedding_magnitude_mean': all_magnitudes.mean().item(),
+        'embedding_magnitude_std': all_magnitudes.std().item(),
+        'embedding_magnitude_min': all_magnitudes.min().item(),
+        'embedding_magnitude_max': all_magnitudes.max().item(),
+        'embedding_value_mean': all_values.mean().item(),
+        'embedding_value_std': all_values.std().item(),
+        'embedding_value_min': all_values.min().item(),
+        'embedding_value_max': all_values.max().item(),
+        'nearest_neighbor_accuracy': sum(nearest_neighbor_accuracies) / len(nearest_neighbor_accuracies),
+        'vocab_coverage': vocab_coverage,
+        'vocab_used': vocab_used,
+        'vocab_total': vocab_total,
+        'most_used_tokens': most_used_tokens,
+        'least_used_tokens': least_used_tokens,
+        'embedding_value_histogram': torch.histc(all_values, bins=50, min=-3, max=3).cpu().numpy().tolist(),
+        'embedding_magnitude_histogram': torch.histc(all_magnitudes, bins=50, min=0, max=5).cpu().numpy().tolist(),
+    }
+    
+    return metrics
 
 
 def validate_model(model, val_loader, loss_fn, device, demo_example=None, tokenizer=None):
@@ -210,7 +314,7 @@ def validate_model(model, val_loader, loss_fn, device, demo_example=None, tokeni
             num_batches += 1
             
             # Collect loss vs timestep and cosine similarity vs timestep data (sample every few batches to avoid too much data)
-            if num_batches % 20 == 0:  # Sample every 20th batch
+            if num_batches % 100 == 0:
                 # Compute per-sample losses and cosine similarities for timestep analysis
                 for i in range(batch_size):
                     t = timesteps[i].item()
@@ -290,6 +394,18 @@ def validate_model(model, val_loader, loss_fn, device, demo_example=None, tokeni
     print(f"      🔗 Embedding (t=0):    {avg_embedding_loss:.6f} → {avg_embedding_loss_weighted:.6f} ({embedding_pct:.1f}%)")
     print(f"      📝 Reconstruction:     {avg_reconstruction_loss:.6f} → {avg_reconstruction_loss_weighted:.6f} ({reconstruction_pct:.1f}%)")
     
+    # Compute embedding health metrics
+    print(f"\n🔬 Computing embedding health metrics...")
+    embedding_metrics = compute_embedding_health_metrics(model, val_loader, device)
+    
+    print(f"📊 EMBEDDING HEALTH METRICS:")
+    print(f"   📏 Magnitude: μ={embedding_metrics['embedding_magnitude_mean']:.3f} ± {embedding_metrics['embedding_magnitude_std']:.3f}")
+    print(f"   📏 Range: [{embedding_metrics['embedding_magnitude_min']:.3f}, {embedding_metrics['embedding_magnitude_max']:.3f}]")
+    print(f"   📈 Values: μ={embedding_metrics['embedding_value_mean']:.3f} ± {embedding_metrics['embedding_value_std']:.3f}")
+    print(f"   📈 Range: [{embedding_metrics['embedding_value_min']:.3f}, {embedding_metrics['embedding_value_max']:.3f}]")
+    print(f"   🎯 Nearest Neighbor Accuracy: {embedding_metrics['nearest_neighbor_accuracy']:.3f}")
+    print(f"   📚 Vocab Coverage: {embedding_metrics['vocab_used']}/{embedding_metrics['vocab_total']} ({embedding_metrics['vocab_coverage']:.3f})")
+    
     # Log component analysis to wandb (corrected)
     import wandb
     wandb.log({
@@ -303,6 +419,28 @@ def validate_model(model, val_loader, loss_fn, device, demo_example=None, tokeni
         "val/loss/embedding_weighted": avg_embedding_loss_weighted,
         "val/loss/reconstruction_weighted": avg_reconstruction_loss_weighted,
         "val/t0_samples_per_batch": avg_t0_samples,
+        
+        # Embedding health metrics
+        "embeddings/magnitude_mean": embedding_metrics['embedding_magnitude_mean'],
+        "embeddings/magnitude_std": embedding_metrics['embedding_magnitude_std'],
+        "embeddings/magnitude_min": embedding_metrics['embedding_magnitude_min'],
+        "embeddings/magnitude_max": embedding_metrics['embedding_magnitude_max'],
+        "embeddings/value_mean": embedding_metrics['embedding_value_mean'],
+        "embeddings/value_std": embedding_metrics['embedding_value_std'],
+        "embeddings/value_min": embedding_metrics['embedding_value_min'],
+        "embeddings/value_max": embedding_metrics['embedding_value_max'],
+        "embeddings/nearest_neighbor_accuracy": embedding_metrics['nearest_neighbor_accuracy'],
+        "embeddings/vocab_coverage": embedding_metrics['vocab_coverage'],
+        "embeddings/vocab_used": embedding_metrics['vocab_used'],
+        "embeddings/vocab_total": embedding_metrics['vocab_total'],
+        
+        # Histograms
+        "embeddings/value_histogram": wandb.Histogram(embedding_metrics['embedding_value_histogram']),
+        "embeddings/magnitude_histogram": wandb.Histogram(embedding_metrics['embedding_magnitude_histogram']),
+        
+        # Token usage analysis
+        "embeddings/most_used_tokens": embedding_metrics['most_used_tokens'],
+        "embeddings/least_used_tokens": embedding_metrics['least_used_tokens'],
     })
     
     # Demo denoising during validation
@@ -330,13 +468,12 @@ def validate_model(model, val_loader, loss_fn, device, demo_example=None, tokeni
         except Exception as e:
             print(f"⚠️ Demo failed: {e}")
     
-    return avg_total_loss, avg_cosine_sim, avg_magnitude_ratio
+    return avg_total_loss, avg_cosine_sim, avg_magnitude_ratio, embedding_metrics
 
 def train_denoiser(
     model: BartDiffusionLM,
     train_loader: DataLoader,
     val_loader: DataLoader,
-    num_epochs: int,
     config_info: dict,
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
     start_epoch: int = 0,
@@ -454,7 +591,7 @@ def train_denoiser(
         }
     
     # Adaptive learning rate based on model size
-    base_lr = 5e-5 if config_info["vocab_size"] <= 15000 else 2e-5  # Lower LR for larger models
+    base_lr = 2e-5 if "vocab_size" in config_info and config_info["vocab_size"] <= 15000 else 5e-5
     optimizer = torch.optim.AdamW(model.parameters(), lr=base_lr, weight_decay=0.01)
     
     # Use ReduceLROnPlateau with validation loss (lower is better)
@@ -484,7 +621,7 @@ def train_denoiser(
         'config_info': config_info,
     })
     
-    print(f"🚀 Starting Diffusion-LM training from epoch {start_epoch} to {start_epoch + num_epochs}")
+    print(f"🚀 Starting Diffusion-LM training from epoch {start_epoch} (patience {patience})")
     
     # select demo example from train loader
     demo_batch = next(iter(train_loader))
@@ -493,7 +630,8 @@ def train_denoiser(
         'attention_mask': demo_batch['attention_mask'][1]
     }
     
-    for epoch in range(start_epoch, start_epoch + num_epochs):
+    epoch = start_epoch
+    while True:
         # Update training state for current epoch
         training_state['current_epoch'] = epoch
         
@@ -508,7 +646,7 @@ def train_denoiser(
         epoch_denoising_improvement = 0
         epoch_start_time = time.time()
         
-        for batch_idx, batch in enumerate(tqdm(train_loader, desc=f"Epoch {epoch + 1}/{start_epoch + num_epochs}")):
+        for batch_idx, batch in enumerate(tqdm(train_loader, desc=f"Epoch {epoch + 1} (patience: {patience_counter}/{patience})")):
             # Move batch to device
             input_ids = batch['input_ids'].to(device)
             attention_mask = batch['attention_mask'].to(device)
@@ -556,7 +694,6 @@ def train_denoiser(
                 total_weighted_batch = (loss_dict['diffusion_loss_weighted'].item() + 
                                       loss_dict['embedding_loss_weighted'].item() + 
                                       loss_dict['reconstruction_loss_weighted'].item())
-                
 
                 wandb.log({
                     # Main training metrics
@@ -584,7 +721,7 @@ def train_denoiser(
                 })
         
         # Validation
-        val_loss, val_cosine_sim, val_magnitude_ratio = validate_model(
+        val_loss, val_cosine_sim, val_magnitude_ratio, embedding_metrics = validate_model(
             model, val_loader, diffusion_lm_loss, device, 
             demo_example=demo_example, tokenizer=tokenizer
         )
@@ -662,18 +799,23 @@ def train_denoiser(
             
             # Progress tracking
             "epoch": epoch,
-            "training_progress": (epoch + 1 - start_epoch) / num_epochs,
+            "training_progress": patience_counter / patience,  # Progress based on patience
             "absolute_epoch": epoch + 1,
             "best_val_loss": best_val_loss,
-            "patience_counter": patience_counter
+            "patience_counter": patience_counter,
+            
+            # Embedding health metrics (epoch-level summary)
+            "epoch/embedding_magnitude_mean": embedding_metrics['embedding_magnitude_mean'],
+            "epoch/embedding_nearest_neighbor_accuracy": embedding_metrics['nearest_neighbor_accuracy'],
+            "epoch/embedding_vocab_coverage": embedding_metrics['vocab_coverage']
         })
         
         print(f"\n{'='*80}")
         current_epoch_in_session = epoch + 1 - start_epoch
-        print(f"Epoch {epoch + 1} ({current_epoch_in_session}/{num_epochs} in session - {current_epoch_in_session/num_epochs*100:.1f}%) - Time: {epoch_time:.2f}s")
+        print(f"Epoch {epoch + 1} (session epoch {current_epoch_in_session}) - Time: {epoch_time:.2f}s")
         print(f"{'='*80}")
         
-        # Loss metrics - FOREFRONT
+        # Loss metrics
         print(f"🎯 Diffusion-LM Loss (x_0 prediction):")
         print(f"   📉 Train Loss: {avg_train_loss:.6f} | Val Loss: {val_loss:.6f}")
         print(f"   🏆 Best Val Loss: {best_val_loss:.6f}")
@@ -684,10 +826,11 @@ def train_denoiser(
         print(f"   Magnitude Ratio - Train: {avg_train_magnitude_ratio:.4f} | Val: {val_magnitude_ratio:.4f}")
         print(f"   Denoising Improvement: {avg_denoising_improvement:.4f}")
         
-        # Magnitude analysis
-        magnitude_scale = avg_train_pred_magnitude / (avg_train_target_magnitude + 1e-8)
-        print(f"🔍 Magnitude Analysis:")
-        print(f"   Predicted: {avg_train_pred_magnitude:.3f} | Target: {avg_train_target_magnitude:.3f} | Scale Factor: {magnitude_scale:.3f}")
+        # Add embedding health summary  
+        print(f"🔬 Embedding Health Summary:")
+        print(f"   Magnitude: {embedding_metrics['embedding_magnitude_mean']:.3f} ± {embedding_metrics['embedding_magnitude_std']:.3f}")
+        print(f"   Nearest Neighbor Accuracy: {embedding_metrics['nearest_neighbor_accuracy']:.3f}")
+        print(f"   Vocab Coverage: {embedding_metrics['vocab_coverage']:.3f}")
         
         # Training efficiency
         print(f"⚡ Training Speed:")
@@ -727,6 +870,9 @@ def train_denoiser(
         if patience_counter >= patience:
             print(f"⏹️  Early stopping triggered after {epoch + 1} epochs (no loss improvement)")
             break
+            
+        # Increment epoch for next iteration
+        epoch += 1
     
     # Training summary
     print(f"\n{'='*80}")
@@ -903,7 +1049,8 @@ def main(model_type: str = "tiny", checkpoint_path=None):
     print(f"   🎯 Target examples: {target_examples:,}")
     
     # 2. init wandb
-    run_name = f"diffusion-lm-{model_type}-v111"
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_name = f"diffusion-lm-{model_type}-v{timestamp}"
     wandb.init(
         project="text-diffusion",
         name=run_name,
@@ -916,10 +1063,10 @@ def main(model_type: str = "tiny", checkpoint_path=None):
             "model_params": f"{param_count/1e6:.1f}M",
             "training_examples": target_examples,
             "batch_size": config_info["batch_size"],
-            "learning_rate": 5e-5 if config_info["vocab_size"] <= 15000 else 2e-5,
-            "num_epochs": 5,
+            "learning_rate": 5e-5,
+            "patience": 2,
             "sequence_length": config_info["sequence_length"],
-            "vocab_size": config_info["vocab_size"],
+            "vocab_size": model.bart_config.vocab_size,
             "dataset": "OpenWebText",
             "noise_scheduler": "sqrt",
             "num_timesteps": 2000,
@@ -950,9 +1097,11 @@ def main(model_type: str = "tiny", checkpoint_path=None):
     train_dataset = StreamingTextDataset(
         tokenizer=tokenizer,
         chunk_size=sequence_length,
-        vocab_size=config_info["vocab_size"],
+        vocab_size=config_info.get("vocab_size", tokenizer.vocab_size),
         num_examples=target_examples + 5000,
     )
+    
+    print(f"   🗣️ Using vocab_size: {config_info.get("vocab_size", tokenizer.vocab_size)}")
     
     # First, collect validation examples from the beginning of the stream
     validation_examples = collect_validation_examples(
@@ -965,16 +1114,20 @@ def main(model_type: str = "tiny", checkpoint_path=None):
 
     # Optimized DataLoaders with configured batch size
     batch_size = config_info["batch_size"]
+    num_workers = min(8, os.cpu_count() or 1)  # Use multiple workers for data loading
+    
     train_loader = DataLoader(
         train_dataset, 
         batch_size=batch_size,
-        pin_memory=False,  # Data already on GPU, pin_memory not needed
+        num_workers=num_workers,
+        pin_memory=True if device == "cuda" else False,
+        prefetch_factor=4 if num_workers > 0 else 2,
     )
     val_loader = DataLoader(
         val_dataset, 
         batch_size=batch_size,  # Match training batch size
         shuffle=False, 
-        pin_memory=False,  # Data already on GPU, pin_memory not needed
+        pin_memory=True if device == "cuda" else False,
     )
     
     # Log dataset info
@@ -985,8 +1138,6 @@ def main(model_type: str = "tiny", checkpoint_path=None):
         "dataset/val_batches": len(val_loader),
         "dataset/streaming": True,
         "dataset/same_distribution": True,
-        "dataset/validation_source": "OpenWebText stream (first chunk)",
-        "dataset/training_source": "OpenWebText stream (infinite)"
     })
     
     # Move model to device
@@ -1003,7 +1154,7 @@ def main(model_type: str = "tiny", checkpoint_path=None):
     start_time = time.time()
     history = train_denoiser(
         model, train_loader, val_loader, 
-        num_epochs=5, config_info=config_info, device=device,
+        config_info=config_info, device=device,
         start_epoch=start_epoch, 
         initial_best_val_loss=initial_best_val_loss,
         tokenizer=tokenizer
@@ -1033,7 +1184,6 @@ def main(model_type: str = "tiny", checkpoint_path=None):
     wandb.finish()
 
 if __name__ == "__main__":
-    import sys
     import argparse
     
     parser = argparse.ArgumentParser(description="Train BART Diffusion Model")
