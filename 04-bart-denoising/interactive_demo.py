@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Interactive BART Diffusion Denoising Demo
+Interactive Diffusion Denoising Demo
 
 Usage:
     echo "Your text here" | python interactive_demo.py
@@ -14,12 +14,12 @@ import torch.nn.functional as F
 from transformers import BartTokenizer
 from typing import Dict, Any
 
-from denoiser import BartDiffusionLM, decode_latents_to_text
+from denoiser import DiffusionLM, decode_latents_to_text
 from train_denoiser import load_checkpoint
 
 
-def load_model(device: str, model_path: str = "best_diffusion_lm_denoiser.pt") -> BartDiffusionLM:
-    """Load the trained BartDiffusionLM model"""
+def load_model(device: str, model_path: str = "best_diffusion_lm_denoiser.pt") -> DiffusionLM:
+    """Load the trained DiffusionLM model"""
     print(f"📥 Loading model from {model_path}...", file=sys.stderr)
     
     model, metadata, success = load_checkpoint(model_path, device)
@@ -37,8 +37,8 @@ def load_model(device: str, model_path: str = "best_diffusion_lm_denoiser.pt") -
 
 def denoise_at_timestep(
     text: str, 
-    model: BartDiffusionLM, 
-    tokenizer: BartTokenizer, 
+    model: DiffusionLM, 
+    tokenizer, 
     device: str, 
     timestep: int
 ) -> Dict[str, Any]:
@@ -55,7 +55,7 @@ def denoise_at_timestep(
     
     # Filter vocabulary to match model's vocab_size
     input_ids = inputs['input_ids']
-    vocab_size = model.bart_config.vocab_size
+    vocab_size = model.encoder.get_vocab_size()
     unk_token_id = tokenizer.unk_token_id if tokenizer.unk_token_id is not None else 3
     
     # Replace any token ID >= vocab_size with UNK token
@@ -121,7 +121,7 @@ def main():
     """Main interactive demo function"""
     import argparse
     
-    parser = argparse.ArgumentParser(description="Interactive BART Diffusion Denoising Demo")
+    parser = argparse.ArgumentParser(description="Interactive Diffusion Denoising Demo")
     parser.add_argument("--model", type=str, default="best_diffusion_lm_denoiser.pt",
                        help="Path to model checkpoint")
     parser.add_argument("--timesteps", type=int, nargs='+', default=[0, 1, 200, 1000],

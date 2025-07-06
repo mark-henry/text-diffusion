@@ -154,7 +154,7 @@ class StreamingTextDataset(Dataset):
         Initialize streaming dataset.
         
         Args:
-            tokenizer: BART tokenizer for processing (used for vocab filtering)
+            tokenizer: tokenizer for processing (used for vocab filtering)
             chunk_size: Target tokens per raw example
             vocab_size: Vocabulary size for filtering
         """

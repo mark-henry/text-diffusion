@@ -899,3 +899,30 @@ The target embeddings x_0 were being created by passing the target tokens throug
 It is much slower to converge now. I imagine embeddings dragging behind like a boat anchor, decreasing the learning rate closer to linear. They're a moving target. Should I increase their learning rate? decrease it? Or just let them vibe?
 
 Started a 'medium' training run. Just let the embeddings vibe. CPU and GPU are both maxed, yayyyy! 1hr per epoch here we goooo
+
+# 2025-07-04
+
+Basically the same results. It's time to try bert instead of bart
+
+```
+
+📍 Step 19/20 (t=105, noise=22.9%, clamp=🔒 ON)
+🔤 Current text: 'bike potter likewise 1993 caps rob tightte baltimore jtia submit flash threeally bombs improvingtime iraqi pricefort owed gift rating references notes colleges humans substantially,ationfar exists cape canal opportunities repair wholio location lover 59 plus installed university fight exclusively directions mk male coin decided next capabilities old consistspo apology germansdt poundsd proved talk'
+🔤 Predicted final text: 'half loose secondary heavily oil multiple use process is chiefcha right culture three would world right responsibility waiting states fool expertt rating ’ executive with dirty, co our / mayer million their who of fact differences :ke comfortable university wrong through could abs both without completely next se old prevent matter howuer app ” of app the'
+📊 Latent stats: mean=-0.008, std=1.008
+
+📍 Step 20/20 (t=0, noise=0.0%, clamp=🔒 ON)
+🔤 Current text: 'typically loose secondary heavily oil multiple use process is chiefcha right culture three would world right responsibility waiting states fool expertt rating ’ executive with dirty, time years / mayer million their who of fact differences :ke comfortable university wrong through could fluid third without completely next se old players matter how profits app ” of app the'
+🔤 Predicted final text: 'typically loose secondary heavily oil multiple use process is chiefcha right culture three would world right responsibility waiting states fool expertt rating ’ executive with dirty, time years / mayer million their who of fact differences :ke comfortable university wrong through could fluid third without completely next se old players matter how profits app ” of app the'
+📊 Latent stats: mean=-0.001, std=0.100
+
+================================================================================
+🎉 Progressive denoising complete!
+🎯 Final generated text: 'typically loose secondary heavily oil multiple use process is chiefcha right culture three would world right responsibility waiting states fool expertt rating ’ executive with dirty, time years / mayer million their who of fact differences :ke comfortable university wrong through could fluid third without completely next se old players matter how profits app ” of app the'
+```
+
+yes YES
+
+now bigger (15M params)
+
+#2025-07-06

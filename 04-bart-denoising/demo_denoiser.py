@@ -7,15 +7,15 @@ import random
 import numpy as np
 
 from denoiser import (
-    BartDiffusionLM,
+    DiffusionLM,
     get_substantial_texts_from_dataset,
     demo_denoising_step
 )
 from train_denoiser import load_checkpoint
 
 
-def load_model(device, model_path="best_diffusion_lm_denoiser.pt") -> Optional[BartDiffusionLM]:
-    """Load the trained BartDiffusionLM model with robust configuration detection"""
+def load_model(device, model_path="best_diffusion_lm_denoiser.pt") -> Optional[DiffusionLM]:
+    """Load the trained DiffusionLM model with robust configuration detection"""
     print(f"Loading trained model from {model_path}...")
     
     # Use the loading function from train_denoiser
@@ -66,7 +66,7 @@ def test_model_performance(diffusion_model, tokenizer, device, num_samples=10):
             
             # Filter vocabulary to match model's vocab_size (same as in demo_denoising_step)
             input_ids = inputs['input_ids']
-            vocab_size = diffusion_model.bart_config.vocab_size
+            vocab_size = diffusion_model.encoder.get_vocab_size()
             unk_token_id = tokenizer.unk_token_id if tokenizer.unk_token_id is not None else 3
             
             # Replace any token ID >= vocab_size with UNK token
@@ -198,7 +198,7 @@ def demonstrate_denoising_examples(diffusion_model, tokenizer, device, num_examp
             
             # Filter vocabulary to match model's vocab_size
             input_ids = inputs['input_ids']
-            vocab_size = diffusion_model.bart_config.vocab_size
+            vocab_size = diffusion_model.encoder.get_vocab_size()
             unk_token_id = tokenizer.unk_token_id if tokenizer.unk_token_id is not None else 3
             
             # Replace any token ID >= vocab_size with UNK token
@@ -226,7 +226,7 @@ def main():
     import argparse
     
     # Parse command line arguments
-    parser = argparse.ArgumentParser(description="Demo BART Diffusion Model")
+    parser = argparse.ArgumentParser(description="Demo Diffusion Model")
     parser.add_argument("--checkpoint", type=str, default="best_diffusion_lm_denoiser.pt",
                        help="Path to model checkpoint")
     parser.add_argument("--samples", type=int, default=15,
@@ -255,7 +255,6 @@ def main():
     print(f"\n🎯 Model successfully loaded! Ready to demonstrate denoising capabilities.")
     print(f"\n📊 MODEL METADATA")
     print(f"{'='*50}")
-    print(f"• Model Type: BART Diffusion Language Model")
     print(f"• Noise Scheduler: {diffusion_model.scheduler.__class__.__name__}")
     print(f"• Model Parameters: {sum(p.numel() for p in diffusion_model.parameters()):,}")
     print(f"• Device: {device}")

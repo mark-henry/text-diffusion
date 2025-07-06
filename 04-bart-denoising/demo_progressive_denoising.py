@@ -7,15 +7,15 @@ This script demonstrates the full diffusion sampling process:
 2. Progressively denoise using the trained model
 3. Show intermediate steps and final decoded text
 
-The demo uses the trained model to generate text from scratch,
-showcasing the reverse diffusion process.
+The demo uses the trained unified diffusion model to generate text from scratch,
+showcasing the reverse diffusion process for both BART and BERT encoders.
 """
 
 import torch
-from transformers import BartTokenizer
+from transformers import BartTokenizer, BertTokenizer
 
 # Import our modules
-from denoiser import BartDiffusionLM, diffusion_sample_step, decode_latents_to_text
+from denoiser import DiffusionLM, diffusion_sample_step, decode_latents_to_text
 from train_denoiser import load_checkpoint
 
 
@@ -55,21 +55,27 @@ def progressive_denoising_demo(
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"🔧 Using device: {device}")
     
-    # Initialize tokenizer
-    print("📝 Loading tokenizer...")
-    tokenizer = BartTokenizer.from_pretrained("facebook/bart-base")
-    
     print(f"💾 Loading model...")
     model, metadata, success = load_checkpoint(model_path, str(device))
-    if not success:
+    if not success or model is None:
         print("❌ Failed to load model with configuration!")
         return None, "Failed to load model"
     
     print(f"🤖 Loaded model for progressive denoising")
     model.eval()  # Set to evaluation mode
     
+    # Load appropriate tokenizer based on encoder type
+    print(f"📝 Loading {model.encoder_type.upper()} tokenizer...")
+    if model.encoder_type == "bart":
+        tokenizer = BartTokenizer.from_pretrained("facebook/bart-base")
+    elif model.encoder_type == "bert":
+        tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
+    else:
+        print(f"❌ Unsupported encoder type: {model.encoder_type}")
+        return None, "Unsupported encoder type"
+    
     # Get model dimensions
-    embed_dim = model.bart_config.d_model
+    embed_dim = model.encoder.get_latent_dim()
     print(f"📏 Model dimensions: seq_len={seq_len}, embed_dim={embed_dim}")
     
     # Create random starting latents (pure noise)

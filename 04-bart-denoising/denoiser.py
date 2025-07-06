@@ -1,9 +1,11 @@
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset
-from transformers import BartTokenizer, BartModel, BartConfig
-from typing import List, Tuple, Dict, Optional
+from typing import List, Tuple, Dict, Optional, Union
 import torch.nn.functional as F
+
+# Import encoder abstractions
+from encoders import BaseEncoder, BartEncoder, BertEncoder
 
 
 class CosineNoiseScheduler:
@@ -115,7 +117,7 @@ def pad_tensor(tensor: torch.Tensor, target_length: int) -> torch.Tensor:
 
 class TextDataset(Dataset):
     """Dataset that returns raw text and token IDs for dynamic latent computation."""
-    def __init__(self, tokenizer: BartTokenizer, dataset: List[str], max_length: int, vocab_size: Optional[int] = None):
+    def __init__(self, tokenizer, dataset: List[str], max_length: int, vocab_size: Optional[int] = None):
         self.tokenizer = tokenizer
         self.dataset = [text for text in dataset if text.strip()]  # Filter empty texts
         self.max_length = max_length
@@ -125,7 +127,7 @@ class TextDataset(Dataset):
         if unk_id is not None and isinstance(unk_id, int):
             self.unk_token_id = unk_id
         else:
-            self.unk_token_id = 3  # BART's default UNK token ID
+            raise ValueError(f"UNK token ID is not set for tokenizer {tokenizer}")
         
         if vocab_size is not None:
             print(f"📝 TextDataset: Filtering vocabulary to {vocab_size:,} tokens (UNK token: {self.unk_token_id})")
@@ -152,21 +154,24 @@ class TextDataset(Dataset):
         }
 
 
-class BartDiffusionLM(nn.Module):
+class DiffusionLM(nn.Module):
     """
-    BART-based diffusion language model following Li et al. 2022 approach.
+    Unified diffusion language model following Li et al. 2022 approach.
     
     Architecture:
-    - Uses BART's embedding layers (TRAINABLE) to handle latent -> embedding conversion
-    - Uses BART's transformer layers (TRAINABLE) for processing
+    - Uses encoder to handle latent -> embedding conversion
+    - Uses encoder's transformer layers (TRAINABLE) for processing
     - Predicts clean latents x_0 instead of noise
     - Uses sinusoidal time embeddings for timestep conditioning
     """
-    def __init__(self, bart_model_name="facebook/bart-base", max_length=64, time_embed_dim=None, num_timesteps=2000, scheduler=None, dropout=0.1, custom_config: Optional[BartConfig] = None):
+    def __init__(self, encoder_type: str = "bart", model_name: Optional[str] = None, max_length: int = 64, 
+                 time_embed_dim: Optional[int] = None, num_timesteps: int = 2000, scheduler=None, 
+                 dropout: float = 0.1, custom_config: Optional[Union[Dict, object]] = None):
         super().__init__()
         self.max_length = max_length
         self.num_timesteps = num_timesteps
         self.dropout_prob = dropout
+        self.encoder_type = encoder_type.lower()
         
         # Initialize noise scheduler - use sqrt schedule by default as recommended in paper
         if scheduler is None:
@@ -174,66 +179,32 @@ class BartDiffusionLM(nn.Module):
         else:
             self._scheduler = scheduler
         
-        # Load BART model and extract components
-        if custom_config is not None:
-            self.bart_config = custom_config
+        # Create the appropriate encoder
+        if self.encoder_type == "bart":
+            default_model_name = "facebook/bart-base"
+            self.encoder = BartEncoder(
+                model_name=model_name or default_model_name,
+                max_length=max_length,
+                dropout=dropout,
+                custom_config=custom_config
+            )
+        elif self.encoder_type == "bert":
+            default_model_name = "bert-base-uncased"
+            self.encoder = BertEncoder(
+                model_name=model_name or default_model_name,
+                max_length=max_length,
+                dropout=dropout,
+                custom_config=custom_config
+            )
         else:
-            self.bart_config = BartConfig.from_pretrained(bart_model_name)
-        
-        # Set time_embed_dim after we have bart_config
-        self.time_embed_dim = time_embed_dim if time_embed_dim is not None else self.bart_config.d_model
-        
-        # Configure BART's dropout to match our dropout setting
-        self.bart_config.hidden_dropout_prob = dropout
-        self.bart_config.attention_probs_dropout_prob = dropout
-        
-        # Load or create BART model
-        if custom_config is not None:
-            # Create new model with custom config (randomly initialized)
-            print("   Creating new model with random initialization...")
-            self.bart_model = BartModel(config=custom_config)
-        else:
-            # Load pretrained model
-            self.bart_model = BartModel.from_pretrained(bart_model_name, config=self.bart_config)
+            raise ValueError(f"Unsupported encoder type: {encoder_type}. Must be 'bart' or 'bert'")
 
-        self.latent_dim = self.bart_config.d_model
+        # Set dimensions from encoder
+        self.latent_dim = self.encoder.get_latent_dim()
+        self.max_length = self.encoder.max_length  # Use encoder's adjusted max_length
         
-        # Ensure max_length doesn't exceed BART's position embedding limit
-        max_pos_embeds = self.bart_config.max_position_embeddings
-        if max_length > max_pos_embeds:
-            print(f"Warning: max_length {max_length} exceeds BART's max_position_embeddings {max_pos_embeds}")
-            self.max_length = min(max_length, max_pos_embeds - 2)  # -2 for safety margin
-            print(f"Adjusted max_length to {self.max_length}")
-        
-        # Extract BART components
-        encoder = self.bart_model.encoder
-        # Remove decoder weights to save memory - we only need encoder
-        del self.bart_model.decoder
-        
-        # TRAINABLE: BART's embedding layers (now learnable)
-        self.embed_positions = encoder.embed_positions  
-        self.layernorm_embedding = encoder.layernorm_embedding
-        
-        # Unfreeze embedding layers - make them trainable
-        for param in encoder.embed_tokens.parameters():
-            param.requires_grad = True
-        for param in self.embed_positions.parameters():
-            param.requires_grad = True
-        for param in self.layernorm_embedding.parameters():
-            param.requires_grad = True
-            
-        embedding_params = sum(p.numel() for p in encoder.embed_tokens.parameters()) + \
-                          sum(p.numel() for p in encoder.embed_positions.parameters()) + \
-                          sum(p.numel() for p in encoder.layernorm_embedding.parameters())
-        print(f"✅ Made BART embedding layers trainable ({embedding_params:,} trainable params)")
-        
-        # TRAINABLE: unfreeze BART's transformer layers
-        self.transformer_layers = encoder.layers
-        for param in self.transformer_layers.parameters():
-            param.requires_grad = True
-            
-        transformer_params = sum(p.numel() for p in self.transformer_layers.parameters() if p.requires_grad)
-        print(f"✅ Made BART transformer layers trainable ({transformer_params:,} trainable params)")
+        # Set time_embed_dim after we have encoder
+        self.time_embed_dim = time_embed_dim if time_embed_dim is not None else self.latent_dim
         
         # dropout layer 
         self.dropout = nn.Dropout(dropout)
@@ -242,51 +213,30 @@ class BartDiffusionLM(nn.Module):
         self.time_embed = nn.Sequential(
             nn.Linear(self.time_embed_dim, self.time_embed_dim),
             nn.SiLU(),
-            nn.Linear(self.time_embed_dim, self.bart_config.d_model),
+            nn.Linear(self.time_embed_dim, self.latent_dim),
         )
         
     @property
     def scheduler(self):
         """Access the noise scheduler used by this model."""
         return self._scheduler
+    
+    @property 
+    def config(self):
+        """Access the encoder's config for backward compatibility."""
+        return self.encoder.config
         
     def embed_tokens(self, input_ids, attention_mask=None) -> torch.Tensor:
         """
-        Compute embeddings from token IDs using BART embeddings.
+        Compute embeddings from token IDs using the encoder.
         """
-        batch_size, seq_len = input_ids.shape
-        
-        # Ensure sequence length doesn't exceed BART's limits
-        if seq_len > self.max_length:
-            input_ids = input_ids[:, :self.max_length]
-            if attention_mask is not None:
-                attention_mask = attention_mask[:, :self.max_length]
-            seq_len = self.max_length
-        
-        # Get raw token embeddings WITHOUT positional encodings
-        # This gives us pure content embeddings as clean latents
-        token_embeddings = self.bart_model.get_encoder().embed_tokens(input_ids)
-        
-        return token_embeddings
+        return self.encoder.embed_tokens(input_ids, attention_mask)
 
     def get_vocab_logits(self, hidden_states):
         """
         Convert hidden states to vocabulary logits using weight tying.
-        
-        This implements weight tying by using the same weight matrix for both
-        embedding lookup and output projection.
-        
-        Args:
-            hidden_states: [B, L, C] hidden representations
-            
-        Returns:
-            logits: [B, L, vocab_size] vocabulary logits
         """
-        # Weight tying: use embedding weights as output projection
-        # This is the key mechanism that prevents embedding collapse
-        embed_weight = self.bart_model.get_encoder().embed_tokens.weight
-        assert isinstance(embed_weight, torch.Tensor), "Expected embedding weight to be a tensor"
-        return F.linear(hidden_states, embed_weight)
+        return self.encoder.get_vocab_logits(hidden_states)
 
     def get_sinusoidal_embedding(self, timesteps, embedding_dim):
         """
@@ -311,18 +261,18 @@ class BartDiffusionLM(nn.Module):
         2. Time embedding: sinusoidal encoding
         3. Combine: projected inputs + time conditioning
         4. Layer norm and dropout
-        5. BART transformer: process time-conditioned latents (handles position embeddings internally)
+        5. Encoder transformer: process time-conditioned latents (handles position embeddings internally)
         6. Output down-projection: transformer output -> latent space
 
-        NOTE that positional encodings are automatically added by the BART encoder.
+        NOTE that positional encodings are automatically added by the encoder.
         
         Args:
-            noisy_latents: [B, L, C] noisy latents at timestep t (already in BART embedding space)
+            noisy_latents: [B, L, C] noisy latents at timestep t (already in encoder embedding space)
             timesteps: [B] timestep indices
             attention_mask: [B, L] optional attention mask for valid positions
             
         Returns:
-            predicted_x0: [B, L, C] predicted clean latents (in BART embedding space)
+            predicted_x0: [B, L, C] predicted clean latents (in encoder embedding space)
         """
         batch_size, seq_len, embed_dim = noisy_latents.shape
         
@@ -334,14 +284,14 @@ class BartDiffusionLM(nn.Module):
         
         # 2. Create time embeddings using sinusoidal encoding
         time_emb = self.get_sinusoidal_embedding(timesteps, self.time_embed_dim).to(noisy_latents.device)
-        time_emb = self.time_embed(time_emb)  # [B, d_model]
+        time_emb = self.time_embed(time_emb)  # [B, latent_dim]
         # Broadcast time embedding
-        time_proj = time_emb.unsqueeze(1).expand(-1, seq_len, -1)  # [B, L, d_model]
+        time_proj = time_emb.unsqueeze(1).expand(-1, seq_len, -1)  # [B, L, latent_dim]
         
         # 3. Combine projected inputs with time conditioning
-        emb_inputs = proj_inputs + time_proj  # [B, L, d_model]
+        emb_inputs = proj_inputs + time_proj  # [B, L, latent_dim]
         
-        # 4. Don't apply layer normalization, dropout or positional embeddings—BART handles it internally
+        # 4. Don't apply layer normalization, dropout or positional embeddings—encoder handles it internally
         
         # 5. Create attention mask if not provided
         if attention_mask is None:
@@ -349,19 +299,28 @@ class BartDiffusionLM(nn.Module):
         else:
             attention_mask = attention_mask.bool()
             
-        # 6. Process through BART encoder
-        encoder_outputs = self.bart_model.encoder(
-            inputs_embeds=emb_inputs,
-            attention_mask=attention_mask,
-            output_attentions=False,
-            output_hidden_states=False,
-            return_dict=True
-        )
-        
-        # 7. Use BART output directly (no projection needed)
-        predicted_x0 = encoder_outputs.last_hidden_state
+        # 6. Process through encoder
+        predicted_x0 = self.encoder.forward_encoder(emb_inputs, attention_mask)
         
         return predicted_x0
+
+
+# Legacy class names for backward compatibility
+BartDiffusionLM = DiffusionLM  # Backward compatibility alias
+BertDiffusionLM = DiffusionLM  # Backward compatibility alias
+
+
+def encode_text_to_latents(text, model: DiffusionLM, tokenizer, device, max_length=64):
+    """Encode text to embeddings"""
+    # Tokenize
+    inputs = tokenizer(text, return_tensors="pt", max_length=max_length, 
+                      truncation=True, padding="max_length")
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+    
+    with torch.no_grad():
+        latents = model.embed_tokens(inputs['input_ids'], inputs['attention_mask'])
+    
+    return latents
 
 
 def decode_latents_to_text(latents, diffusion_model, tokenizer, attention_mask=None):
@@ -371,8 +330,7 @@ def decode_latents_to_text(latents, diffusion_model, tokenizer, attention_mask=N
     Args:
         latents: [B, L, C] latent representations
         diffusion_model: Model with embedding weights  
-        tokenizer: BART tokenizer
-        device: Device to run on
+        tokenizer: Tokenizer
         attention_mask: [B, L] mask for valid positions
     
     Returns:
@@ -383,16 +341,23 @@ def decode_latents_to_text(latents, diffusion_model, tokenizer, attention_mask=N
             latents, diffusion_model, attention_mask
         )
         
-        # Don't skip special tokens so we can see UNK tokens
-        text = tokenizer.decode(token_ids[0], skip_special_tokens=False)
-        
-        # Clean up the text by removing padding tokens and start/end tokens
-        # but keep UNK tokens visible
-        text = text.replace("<pad>", "").replace("<s>", "").replace("</s>", "")
-        text = text.replace("<unk>", " <unk> ")  # Make UNK tokens more visible
-        
-        # Clean up extra spaces
-        text = " ".join(text.split())
+        # Handle different tokenizer types
+        if hasattr(tokenizer, 'decode'):
+            if diffusion_model.encoder_type == "bart":
+                # Don't skip special tokens so we can see UNK tokens
+                text = tokenizer.decode(token_ids[0], skip_special_tokens=False)
+                
+                # Clean up the text by removing padding tokens and start/end tokens
+                # but keep UNK tokens visible
+                text = text.replace("<pad>", "").replace("<s>", "").replace("</s>", "")
+                text = text.replace("<unk>", " <unk> ")  # Make UNK tokens more visible
+                
+                # Clean up extra spaces
+                text = " ".join(text.split())
+            else:  # BERT
+                text = tokenizer.decode(token_ids[0], skip_special_tokens=True)
+        else:
+            text = str(token_ids[0].tolist())  # Fallback
     
     return text
 
@@ -522,7 +487,7 @@ def clamp_to_embeddings(predicted_x0, diffusion_model, attention_mask=None):
     batch_size, seq_len, embed_dim = predicted_x0.shape
     
     # Get vocabulary embeddings [vocab_size, embed_dim]
-    vocab_embeddings = diffusion_model.bart_model.get_encoder().embed_tokens.weight  # [vocab_size, embed_dim]
+    vocab_embeddings = diffusion_model.encoder.get_embedding_weights()
     
     # Reshape for batch computation
     pred_flat = predicted_x0.view(-1, embed_dim)  # [B*L, embed_dim]
@@ -546,7 +511,8 @@ def clamp_to_embeddings(predicted_x0, diffusion_model, attention_mask=None):
         mask_3d = mask.unsqueeze(-1).expand_as(predicted_x0)  # [B, L, C]
         clamped_x0 = torch.where(mask_3d, clamped_x0, predicted_x0)
         # For token IDs (use pad token for masked positions)  
-        token_ids = torch.where(mask, token_ids, torch.tensor(1, device=token_ids.device))  # 1 is <pad>
+        pad_token_id = diffusion_model.encoder.get_pad_token_id()
+        token_ids = torch.where(mask, token_ids, torch.tensor(pad_token_id, device=token_ids.device))
     
     return clamped_x0, token_ids
 
@@ -629,7 +595,7 @@ def demo_denoising_step(example_dict, diffusion_model, tokenizer, device, timest
     Args:
         example_dict: Input example dict with 'input_ids', 'attention_mask', and optionally 'original_text'
         diffusion_model: Trained diffusion model
-        tokenizer: BART tokenizer
+        tokenizer: Tokenizer
         device: Device to run on
         timestep: Noise level (integer) - discrete timestep index in range [0, num_timesteps-1]
                  Lower values = less noise (e.g., timestep=0 is minimal noise)
@@ -677,7 +643,7 @@ def demo_denoising_step(example_dict, diffusion_model, tokenizer, device, timest
         cosine_sim = F.cosine_similarity(pred_flat, target_flat, dim=1).item()
         
         return {
-            'original_text': tokenizer.decode(inputs['input_ids'][0], skip_special_tokens=False).replace("<pad>", "").replace("<s>", "").replace("</s>", "").replace("<unk>", " <unk> "),
+            'original_text': tokenizer.decode(inputs['input_ids'][0], skip_special_tokens=True),
             'noisy_text': noisy_text,
             'denoised_text': denoised_text,
             'noise_percentage': noise_percentage,

@@ -1,6 +1,6 @@
 import torch
 from torch.utils.data import DataLoader, random_split
-from transformers import BartTokenizer, BartConfig
+from transformers import BartTokenizer, BartConfig, BertTokenizer, BertConfig
 from tqdm import tqdm
 from datasets import load_dataset
 import wandb
@@ -19,7 +19,7 @@ CACHE_DIR = "/mnt/win/Users/markhenry/.cache/huggingface"
 os.environ['HF_HOME'] = CACHE_DIR
 
 from denoiser import (
-    BartDiffusionLM, 
+    DiffusionLM, 
     demo_denoising_step,
     token_discrete_loss
 )
@@ -46,13 +46,37 @@ MODEL_CONFIGS = {
         "sequence_length": 48,
     },
     "medium": {
-        "description": "Medium (15.2M params)",
+        "description": "Medium (10-15.2M params)",
         "vocab_size": 30_000,
         "batch_size": 128,
         "d_model": 256,
         "encoder_layers": 3,
         "attention_heads": 4,
         "sequence_length": 64,
+    }
+}
+
+# Encoder type configurations
+ENCODER_CONFIGS = {
+    "bart": {
+        "tokenizer_class": BartTokenizer,
+        "config_class": BartConfig,
+        "model_name": "facebook/bart-base",
+        "config_mapping": {
+            "d_model": "d_model",
+            "encoder_layers": "encoder_layers", 
+            "attention_heads": "encoder_attention_heads",
+        }
+    },
+    "bert": {
+        "tokenizer_class": BertTokenizer,
+        "config_class": BertConfig,
+        "model_name": "bert-base-uncased",
+        "config_mapping": {
+            "d_model": "hidden_size",
+            "encoder_layers": "num_hidden_layers",
+            "attention_heads": "num_attention_heads",
+        }
     }
 }
 
@@ -114,36 +138,55 @@ def signal_handler(signum, frame):
 # Register signal handler for Ctrl-C
 signal.signal(signal.SIGINT, signal_handler)
 
-def bart_config(model_config: dict) -> BartConfig:
-    return BartConfig(
-        vocab_size=model_config.get('vocab_size', BartConfig.from_pretrained("facebook/bart-base").vocab_size),
-        d_model=model_config['d_model'],
-        encoder_layers=model_config['encoder_layers'],
-        decoder_layers=model_config['encoder_layers'],
-        encoder_attention_heads=model_config['attention_heads'],
-    )
+def create_encoder_config(model_config: dict, encoder_type: str):
+    """Create encoder-specific config from unified model config."""
+    encoder_config = ENCODER_CONFIGS[encoder_type]
+    config_class = encoder_config["config_class"]
+    config_mapping = encoder_config["config_mapping"]
+    
+    # Map unified config to encoder-specific config
+    encoder_specific_config = {}
+    for unified_key, encoder_key in config_mapping.items():
+        if unified_key in model_config:
+            encoder_specific_config[encoder_key] = model_config[unified_key]
+    
+    # Add vocab_size
+    encoder_specific_config['vocab_size'] = model_config.get('vocab_size', 30000)
+    
+    # Add encoder-specific parameters
+    if encoder_type == "bart":
+        encoder_specific_config['decoder_layers'] = model_config['encoder_layers']
+        encoder_specific_config['decoder_attention_heads'] = model_config['attention_heads']
+    elif encoder_type == "bert":
+        encoder_specific_config['intermediate_size'] = model_config['d_model'] * 4
+    
+    return config_class(**encoder_specific_config)
 
 def config_info(model):
     return {
-        'vocab_size': model.bart_config.vocab_size,
-        'd_model': model.bart_config.d_model,
-        'encoder_layers': model.bart_config.encoder_layers,
-        'decoder_layers': model.bart_config.decoder_layers,
+        'vocab_size': model.config.vocab_size,
+        'd_model': model.encoder.get_latent_dim(),
+        'encoder_layers': getattr(model.config, 'encoder_layers', getattr(model.config, 'num_hidden_layers', 1)),
         'max_length': model.max_length,
         'time_embed_dim': model.time_embed_dim,
         'num_timesteps': model.scheduler.num_timesteps,
         'dropout': model.dropout_prob,
-        'bart_config': model.bart_config,
+        'encoder_type': model.encoder_type,
+        'encoder_config': model.config,
     }
 
-def create_model(config_info: dict):
-    model = BartDiffusionLM(
-        bart_model_name="facebook/bart-base",  # Not used when custom_config provided
-        max_length=config_info["sequence_length"],  # Use sequence length from config
+def create_model(config_info: dict, encoder_type: str = "bert"):
+    """Create a DiffusionLM model with the specified encoder type."""
+    encoder_config = create_encoder_config(config_info, encoder_type)
+    
+    model = DiffusionLM(
+        encoder_type=encoder_type,
+        model_name=None,  # Use default for encoder type
+        max_length=config_info["sequence_length"],
         time_embed_dim=256,
         num_timesteps=2000,
         dropout=0.1,
-        custom_config=bart_config(config_info)
+        custom_config=encoder_config
     )
     
     return model
@@ -157,10 +200,10 @@ def compute_embedding_health_metrics(model, val_loader, device):
     embedding_magnitudes = []
     embedding_values = []
     nearest_neighbor_accuracies = []
-    vocab_usage_counts = torch.zeros(model.bart_config.vocab_size, device=device)
+    vocab_usage_counts = torch.zeros(model.encoder.get_vocab_size(), device=device)
     
     # Get vocabulary embeddings for comparison
-    vocab_embeddings = model.bart_model.get_encoder().embed_tokens.weight  # [vocab_size, embed_dim]
+    vocab_embeddings = model.encoder.get_embedding_weights()  # [vocab_size, embed_dim]
     
     with torch.no_grad():
         for batch_idx, batch in enumerate(val_loader):
@@ -217,7 +260,7 @@ def compute_embedding_health_metrics(model, val_loader, device):
             # Track vocabulary usage
             unique_tokens = input_ids[attention_mask.bool()] if attention_mask is not None else input_ids.reshape(-1)
             for token in unique_tokens:
-                if 0 <= token < model.bart_config.vocab_size:
+                if 0 <= token < model.encoder.get_vocab_size():
                     vocab_usage_counts[token] += 1
     
     # Compute statistics
@@ -226,7 +269,7 @@ def compute_embedding_health_metrics(model, val_loader, device):
     
     # Vocabulary usage statistics
     vocab_used = (vocab_usage_counts > 0).sum().item()
-    vocab_total = model.bart_config.vocab_size
+    vocab_total = model.encoder.get_vocab_size()
     vocab_coverage = vocab_used / vocab_total
     
     # Most and least used tokens
@@ -471,7 +514,7 @@ def validate_model(model, val_loader, loss_fn, device, demo_example=None, tokeni
     return avg_total_loss, avg_cosine_sim, avg_magnitude_ratio, embedding_metrics
 
 def train_denoiser(
-    model: BartDiffusionLM,
+    model: DiffusionLM,
     train_loader: DataLoader,
     val_loader: DataLoader,
     config_info: dict,
@@ -930,7 +973,7 @@ def count_model_parameters(model: torch.nn.Module, verbose: bool = True) -> int:
     
     return total_params
 
-def load_checkpoint(checkpoint_path: str, device: Optional[str] = None) -> Tuple[Optional[BartDiffusionLM], Optional[Dict], bool]:
+def load_checkpoint(checkpoint_path: str, device: Optional[str] = None) -> Tuple[Optional[DiffusionLM], Optional[Dict], bool]:
     """
     Robustly load a diffusion model by detecting configuration from the checkpoint.
     
@@ -969,14 +1012,34 @@ def load_checkpoint(checkpoint_path: str, device: Optional[str] = None) -> Tuple
         
         print(f"🤖 Using model with config: d_model={config_info['d_model']}, layers={config_info['encoder_layers']}, vocab={config_info['vocab_size']}")
         
-        # Create the model - use defaults for missing keys
-        model = BartDiffusionLM(
-            bart_model_name="facebook/bart-base",  # Not used when custom_config provided
+        # Create the model - detect encoder type from state_dict if not in config
+        encoder_type = config_info.get('encoder_type')
+        if encoder_type is None:
+            # Auto-detect encoder type from state_dict keys for backward compatibility
+            state_dict = checkpoint['model_state_dict']
+            if 'encoder.model.embeddings.word_embeddings.weight' in state_dict:
+                encoder_type = 'bert'
+                print("🔍 Auto-detected BERT encoder from checkpoint keys")
+            elif 'encoder.model.encoder.embed_tokens.weight' in state_dict:
+                encoder_type = 'bart'
+                print("🔍 Auto-detected BART encoder from checkpoint keys")
+            else:
+                encoder_type = 'bert'  # Default fallback for legacy checkpoints
+                print("⚠️ Could not auto-detect encoder type, defaulting to BERT")
+        
+        # Update config_info with detected encoder_type for future saves
+        config_info['encoder_type'] = encoder_type
+        
+        encoder_config = create_encoder_config(config_info, encoder_type)
+        
+        model = DiffusionLM(
+            encoder_type=encoder_type,
+            model_name=None,  # Use default for encoder type
             max_length=config_info.get('max_length', 64),
             time_embed_dim=config_info.get('time_embed_dim', 256),
             num_timesteps=config_info.get('num_timesteps', 2000),
             dropout=config_info.get('dropout', 0.1),
-            custom_config=bart_config(config_info)
+            custom_config=encoder_config
         ).to(device_obj)
         
         # Load the state dict
@@ -1009,25 +1072,27 @@ def load_checkpoint(checkpoint_path: str, device: Optional[str] = None) -> Tuple
         return None, None, False
 
 
-def main(model_type: str = "tiny", checkpoint_path=None):
+def main(model_type: str = "tiny", encoder_type: str = "bert", checkpoint_path=None):
     """
     Main training function with configurable model types.
     
     Args:
         model_type: from MODEL_CONFIGS
+        encoder_type: "bart" or "bert"
         checkpoint_path: Path to checkpoint for resuming training
     """
-    print(f"=== BART Diffusion Language Model - {model_type.upper()} ===\n")
+    print(f"=== {encoder_type.upper()} Diffusion Language Model - {model_type.upper()} ===\n")
     
     # Load tokenizer first
-    print("Loading BART tokenizer...")
-    tokenizer = BartTokenizer.from_pretrained("facebook/bart-base", use_fast=True)
+    encoder_config = ENCODER_CONFIGS[encoder_type]
+    print(f"Loading {encoder_type.upper()} tokenizer...")
+    tokenizer = encoder_config["tokenizer_class"].from_pretrained(encoder_config["model_name"], use_fast=True)
     
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
     
     # 1. CREATE MODEL AND COUNT PARAMETERS
-    print(f"\n🏗️  Creating {model_type} BART diffusion model...")
+    print(f"\n🏗️  Creating {model_type} {encoder_type.upper()} diffusion model...")
     if checkpoint_path:
         model, metadata, success = load_checkpoint(checkpoint_path, str(device))
         if not success or model is None or metadata is None:
@@ -1038,7 +1103,7 @@ def main(model_type: str = "tiny", checkpoint_path=None):
         print(f"🔄 Continuing Diffusion-LM training from epoch {start_epoch + 1}")
     else:
         config_info = MODEL_CONFIGS[model_type]
-        model = create_model(config_info)
+        model = create_model(config_info, encoder_type)
         start_epoch = 0
     
     # Count parameters and calculate optimal dataset size  
@@ -1055,18 +1120,18 @@ def main(model_type: str = "tiny", checkpoint_path=None):
         project="text-diffusion",
         name=run_name,
         config={
-            "model_type": f"BartDiffusionLM_{model_type.title()}",
+            "model_type": f"DiffusionLM_{encoder_type.upper()}_{model_type.title()}",
             "approach": f"Diffusion-LM (Li et al. 2022) - {model_type.title()}",
             "encoder": config_info["description"],
-            "embeddings": "Custom BART embeddings (trainable)",
-            "architecture": "Custom_BART_encoder + time_embeddings",
+            "embeddings": "Custom embeddings (trainable)",
+            "architecture": f"{encoder_type.upper()} encoder + time_embeddings",
             "model_params": f"{param_count/1e6:.1f}M",
             "training_examples": target_examples,
             "batch_size": config_info["batch_size"],
             "learning_rate": 5e-5,
             "patience": 2,
             "sequence_length": config_info["sequence_length"],
-            "vocab_size": model.bart_config.vocab_size,
+            "vocab_size": model.encoder.get_vocab_size(),
             "dataset": "OpenWebText",
             "noise_scheduler": "sqrt",
             "num_timesteps": 2000,
@@ -1082,7 +1147,6 @@ def main(model_type: str = "tiny", checkpoint_path=None):
             "time_embed_dim": 256,
             "learned_time_scaling": False,
             "trainable_embeddings": True,
-            "attention_mechanisms": "BART_bidirectional",
             "mixed_precision": True,
         }
     )
@@ -1101,7 +1165,7 @@ def main(model_type: str = "tiny", checkpoint_path=None):
         num_examples=target_examples + 5000,
     )
     
-    print(f"   🗣️ Using vocab_size: {config_info.get("vocab_size", tokenizer.vocab_size)}")
+    print(f"   🗣️ Using vocab_size: {config_info.get('vocab_size', getattr(tokenizer, 'vocab_size', 30000))}")
     
     # First, collect validation examples from the beginning of the stream
     validation_examples = collect_validation_examples(
@@ -1142,7 +1206,7 @@ def main(model_type: str = "tiny", checkpoint_path=None):
     
     # Move model to device
     model = model.to(device)
-    print(f"BART Diffusion model moved to device: {device}")
+    print(f"Model moved to device: {device}")
     
     if checkpoint_path:
         print(f"🔄 Continuing Diffusion-LM training from epoch {start_epoch + 1}...")
@@ -1186,9 +1250,11 @@ def main(model_type: str = "tiny", checkpoint_path=None):
 if __name__ == "__main__":
     import argparse
     
-    parser = argparse.ArgumentParser(description="Train BART Diffusion Model")
+    parser = argparse.ArgumentParser(description="Train Diffusion Language Model")
     parser.add_argument("--model", type=str, default="tiny", choices=["tiny", "small", "medium"], 
                        help="Model type to train")
+    parser.add_argument("--encoder", type=str, default="bert", choices=["bart", "bert"],
+                       help="Encoder type to use")
     parser.add_argument("--checkpoint", type=str, default=None,
                        help="Checkpoint path to resume training from")
     parser.add_argument("--continue", action="store_true", default=False,
@@ -1201,8 +1267,8 @@ if __name__ == "__main__":
     
     if args.checkpoint:
         # Explicit checkpoint specified
-        main(model_type=args.model, checkpoint_path=args.checkpoint)
+        main(model_type=args.model, encoder_type=args.encoder, checkpoint_path=args.checkpoint)
     elif getattr(args, 'continue', False):
-        main(model_type=args.model, checkpoint_path=best_checkpoint)
+        main(model_type=args.model, encoder_type=args.encoder, checkpoint_path=best_checkpoint)
     else:
-        main(model_type=args.model)
+        main(model_type=args.model, encoder_type=args.encoder)
