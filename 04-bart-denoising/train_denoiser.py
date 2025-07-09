@@ -1386,7 +1386,7 @@ if __name__ == "__main__":
     import argparse
     
     parser = argparse.ArgumentParser(description="Train Diffusion Language Model")
-    parser.add_argument("--model", type=str, default="tiny", choices=["tiny", "small", "medium"], 
+    parser.add_argument("--model", type=str, default="tiny", 
                        help="Model type to train")
     parser.add_argument("--encoder", type=str, default="bert", choices=["bart", "bert"],
                        help="Encoder type to use")
