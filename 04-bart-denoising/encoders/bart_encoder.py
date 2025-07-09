@@ -1,5 +1,6 @@
 from typing import Optional
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from transformers import BartModel, BartConfig
 from .base_encoder import BaseEncoder
@@ -30,6 +31,11 @@ class BartEncoder(BaseEncoder):
         self.config.hidden_dropout_prob = self.dropout
         self.config.attention_probs_dropout_prob = self.dropout
         
+        # Extract dimensions
+        self.embedding_dim = getattr(self.config, 'embedding_dim', self.config.d_model)  # Fallback to d_model if not specified
+        self.transformer_hidden_dim = self.config.d_model  # Transformer hidden dimension
+        self.vocab_size = self.config.vocab_size
+        
         # Load or create BART model
         if self.custom_config is not None:
             # Create new model with custom config (randomly initialized)
@@ -38,9 +44,6 @@ class BartEncoder(BaseEncoder):
         else:
             # Load pretrained model
             self.model = BartModel.from_pretrained(self.model_name, config=self.config)
-
-        self.latent_dim = self.config.d_model
-        self.vocab_size = self.config.vocab_size
         
         # Ensure max_length doesn't exceed BART's position embedding limit
         max_pos_embeds = self.config.max_position_embeddings
@@ -70,12 +73,36 @@ class BartEncoder(BaseEncoder):
         self.transformer_layers = encoder.layers
         for param in self.transformer_layers.parameters():
             param.requires_grad = True
+        
+        # Input up-projection: embedding space -> transformer hidden space
+        self.input_up_proj = nn.Sequential(
+            nn.Linear(self.embedding_dim, self.transformer_hidden_dim),
+            nn.Tanh(), 
+            nn.Linear(self.transformer_hidden_dim, self.transformer_hidden_dim)
+        )
+        
+        # Output down-projection: transformer hidden space -> embedding space
+        self.output_down_proj = nn.Sequential(
+            nn.Linear(self.transformer_hidden_dim, self.transformer_hidden_dim),
+            nn.Tanh(), 
+            nn.Linear(self.transformer_hidden_dim, self.embedding_dim)
+        )
+        
+        # Always use custom token embeddings for simplicity and consistency
+        print(f"   Creating custom token embeddings with embedding_dim={self.embedding_dim}")
+        self.token_embeddings = nn.Embedding(self.vocab_size, self.embedding_dim)
+        # Initialize with similar distribution to BART's embeddings
+        nn.init.normal_(self.token_embeddings.weight, mean=0.0, std=0.02)
             
         self.report_trainable_parameters()
         
     def get_latent_dim(self) -> int:
-        """Get the latent dimension of the encoder."""
-        return self.latent_dim
+        """Get the latent dimension of the encoder (transformer hidden dimension)."""
+        return self.transformer_hidden_dim
+    
+    def get_embedding_dim(self) -> int:
+        """Get the embedding dimension (before projection to transformer hidden size)."""
+        return self.embedding_dim
     
     def get_vocab_size(self) -> int:
         """Get the vocabulary size."""
@@ -102,28 +129,22 @@ class BartEncoder(BaseEncoder):
                 attention_mask = attention_mask[:, :self.max_length]
             seq_len = self.max_length
         
-        # Get raw token embeddings WITHOUT positional encodings
-        # This gives us pure content embeddings as clean latents
-        token_embeddings = self.model.get_encoder().embed_tokens(input_ids)
+        token_embeddings = self.token_embeddings(input_ids)
         
         return token_embeddings
 
     def get_vocab_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """
-        Convert hidden states to vocabulary logits using weight tying.
-        
-        This implements weight tying by using the same weight matrix for both
-        embedding lookup and output projection.
+        Convert hidden states to vocabulary logits. Same weights are used for both embedding lookup and output projection.
         
         Args:
-            hidden_states: [B, L, C] hidden representations
+            hidden_states: [B, L, embedding_dim] hidden representations in embedding space
             
         Returns:
             logits: [B, L, vocab_size] vocabulary logits
         """
-        # Weight tying: use embedding weights as output projection
-        # This is the key mechanism that prevents embedding collapse
-        embed_weight = self.model.get_encoder().embed_tokens.weight
+        embed_weight = self.token_embeddings.weight
+        
         assert isinstance(embed_weight, torch.Tensor), "Expected embedding weight to be a tensor"
         return F.linear(hidden_states, embed_weight)
     
@@ -132,40 +153,63 @@ class BartEncoder(BaseEncoder):
         Get the embedding weight matrix for clamping.
         
         Returns:
-            Embedding weights [vocab_size, latent_dim]
+            Embedding weights [vocab_size, embedding_dim]
         """
-        return self.model.get_encoder().embed_tokens.weight
+        weight = self.token_embeddings.weight
+        
+        assert isinstance(weight, torch.Tensor), "Expected embedding weight to be a tensor"
+        return weight
         
     def forward_encoder(self, inputs_embeds: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
         """
-        Forward pass through the BART encoder.
+        Forward pass through the BART encoder with projections.
         
         Args:
-            inputs_embeds: Input embeddings [B, L, C]
+            inputs_embeds: Input embeddings [B, L, embedding_dim] in embedding space
             attention_mask: Attention mask [B, L]
             
         Returns:
-            Encoder output [B, L, C]
+            Encoder output [B, L, embedding_dim] projected back to embedding space
         """
+        # Project from embedding space to transformer hidden space
+        projected_inputs = self.input_up_proj(inputs_embeds)  # [B, L, d_model]
+        
         # Process through BART encoder
         encoder_outputs = self.model.encoder(
-            inputs_embeds=inputs_embeds,
+            inputs_embeds=projected_inputs,
             attention_mask=attention_mask,
             output_attentions=False,
             output_hidden_states=False,
             return_dict=True
         )
         
-        return encoder_outputs.last_hidden_state
+        # Project back from transformer hidden space to embedding space
+        hidden_states = encoder_outputs.last_hidden_state  # [B, L, d_model]
+        output_embeddings = self.output_down_proj(hidden_states)  # [B, L, embedding_dim]
+        
+        return output_embeddings
     
     def report_trainable_parameters(self):
         """Report the number of trainable parameters."""
         encoder = self.model.encoder
         
-        embedding_params = sum(p.numel() for p in encoder.embed_tokens.parameters()) + \
-                          sum(p.numel() for p in self.embed_positions.parameters()) + \
-                          sum(p.numel() for p in self.layernorm_embedding.parameters())
-        print(f"✅ Made BART embedding layers trainable ({embedding_params:,} trainable params)")
+        # Count embedding parameters
+        embedding_params = sum(p.numel() for p in self.token_embeddings.parameters())
+        print(f"✅ Custom token embeddings trainable ({embedding_params:,} trainable params)")
         
+        # Count positional embeddings and layer norm
+        pos_embed_params = sum(p.numel() for p in self.embed_positions.parameters())
+        layer_norm_params = sum(p.numel() for p in self.layernorm_embedding.parameters())
+        print(f"✅ BART positional embeddings and layer norm trainable ({pos_embed_params + layer_norm_params:,} trainable params)")
+        
+        # Count projection layer parameters
+        input_proj_params = sum(p.numel() for p in self.input_up_proj.parameters() if p.requires_grad)
+        output_proj_params = sum(p.numel() for p in self.output_down_proj.parameters() if p.requires_grad)
+        total_projections = input_proj_params + output_proj_params
+        print(f"✅ Projection layers trainable ({total_projections:,} trainable params)")
+        print(f"   - Input up-projection: {input_proj_params:,}")
+        print(f"   - Output down-projection: {output_proj_params:,}")
+        
+        # Count transformer parameters
         transformer_params = sum(p.numel() for p in self.transformer_layers.parameters() if p.requires_grad)
-        print(f"✅ Made BART transformer layers trainable ({transformer_params:,} trainable params)") 
+        print(f"✅ BART transformer layers trainable ({transformer_params:,} trainable params)") 

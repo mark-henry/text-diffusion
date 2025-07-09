@@ -219,14 +219,5 @@ def main():
         avg_cosine = sum(r['cosine_similarity'] for r in results) / len(results)
         print(f"\n💡 Average cosine similarity: {avg_cosine:.4f}")
         
-        # Model performance assessment
-        if avg_cosine > 0.8:
-            print("🎉 Model shows strong denoising capability!")
-        elif avg_cosine > 0.6:
-            print("👍 Model shows good denoising capability.")
-        else:
-            print("⚠️  Model may need more training.")
-
-
 if __name__ == "__main__":
     main() 

@@ -201,10 +201,11 @@ class DiffusionLM(nn.Module):
 
         # Set dimensions from encoder
         self.latent_dim = self.encoder.get_latent_dim()
-        self.max_length = self.encoder.max_length  # Use encoder's adjusted max_length
+        self.embedding_dim = self.encoder.get_embedding_dim()
+        self.max_length = self.encoder.max_length
         
         # Set time_embed_dim after we have encoder
-        self.time_embed_dim = time_embed_dim if time_embed_dim is not None else self.latent_dim
+        self.time_embed_dim = time_embed_dim if time_embed_dim is not None else self.embedding_dim
         
         # dropout layer 
         self.dropout = nn.Dropout(dropout)
@@ -213,7 +214,7 @@ class DiffusionLM(nn.Module):
         self.time_embed = nn.Sequential(
             nn.Linear(self.time_embed_dim, self.time_embed_dim),
             nn.SiLU(),
-            nn.Linear(self.time_embed_dim, self.latent_dim),
+            nn.Linear(self.time_embed_dim, self.embedding_dim),
         )
         
     @property
@@ -277,19 +278,19 @@ class DiffusionLM(nn.Module):
         batch_size, seq_len, embed_dim = noisy_latents.shape
         
         # Verify we're working in the correct embedding dimension
-        assert embed_dim == self.latent_dim, f"Expected latent_dim={self.latent_dim}, got {embed_dim}"
+        assert embed_dim == self.embedding_dim, f"Expected embedding_dim={self.embedding_dim}, got {embed_dim}"
         
         # 1. Use noisy latents directly (no projection needed)
         proj_inputs = noisy_latents
         
         # 2. Create time embeddings using sinusoidal encoding
         time_emb = self.get_sinusoidal_embedding(timesteps, self.time_embed_dim).to(noisy_latents.device)
-        time_emb = self.time_embed(time_emb)  # [B, latent_dim]
+        time_emb = self.time_embed(time_emb)  # [B, embedding_dim]
         # Broadcast time embedding
-        time_proj = time_emb.unsqueeze(1).expand(-1, seq_len, -1)  # [B, L, latent_dim]
+        time_proj = time_emb.unsqueeze(1).expand(-1, seq_len, -1)  # [B, L, embedding_dim]
         
         # 3. Combine projected inputs with time conditioning
-        emb_inputs = proj_inputs + time_proj  # [B, L, latent_dim]
+        emb_inputs = proj_inputs + time_proj  # [B, L, embedding_dim]
         
         # 4. Don't apply layer normalization, dropout or positional embeddings—encoder handles it internally
         

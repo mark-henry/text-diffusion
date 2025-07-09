@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Demo: BART Diffusion Model Blank Filling
+Demo: Diffusion Model Blank Filling
 
-This script demonstrates using the trained BART diffusion model for:
+This script demonstrates using the trained diffusion model for:
 1. Filling blanks in sentences (targeted generation)
 2. Open-ended text completion from prompts
 
@@ -11,18 +11,17 @@ The demo uses iterative denoising to generate coherent text completions.
 
 import torch
 import torch.nn.functional as F
-from transformers import BartTokenizer
+from transformers import BertTokenizer
 import random
 import time
 import re
 
 from denoiser import (
-    BartDiffusionLM,
-    load_checkpoint,
+    DiffusionLM,
     diffusion_sample_step,
-    decode_latents_to_text,
-    create_tiny_bart_config
+    decode_latents_to_text
 )
+from train_denoiser import load_checkpoint
 
 
 def find_blank_token_id(tokenizer):
@@ -35,12 +34,12 @@ def find_blank_token_id(tokenizer):
     if hasattr(tokenizer, 'unk_token_id') and tokenizer.unk_token_id is not None:
         return tokenizer.unk_token_id
     
-    # Default to token ID 3 (BART's UNK)
-    return 3
+    # Default to token ID 100 (BERT's UNK)
+    return 100
 
 
-def filter_vocab_for_tiny_model(input_ids, vocab_size=15000, unk_token_id=3):
-    """Filter token IDs to stay within tiny model vocabulary."""
+def filter_vocab_for_model(input_ids, vocab_size=15000, unk_token_id=100):
+    """Filter token IDs to stay within model's vocabulary."""
     out_of_vocab_mask = input_ids >= vocab_size
     return torch.where(out_of_vocab_mask, unk_token_id, input_ids)
 
@@ -60,8 +59,8 @@ def diffusion_sample(
     Generate text using diffusion sampling.
     
     Args:
-        diffusion_model: Trained BartDiffusionLM model
-        tokenizer: BART tokenizer
+        diffusion_model: Trained DiffusionLM model
+        tokenizer: BERT tokenizer
         device: Device to run on
         prompt_text: Starting prompt (can be empty for unconditional generation)
         total_length: Total sequence length to generate
@@ -77,7 +76,7 @@ def diffusion_sample(
         torch.manual_seed(seed)
     
     # Create random starting latents
-    embed_dim = diffusion_model.bart_config.d_model
+    embed_dim = diffusion_model.encoder.get_latent_dim()
     xt = torch.randn(1, total_length, embed_dim, device=device)
     
     # Create attention mask
@@ -91,12 +90,14 @@ def diffusion_sample(
                                  truncation=True, add_special_tokens=False)
         prompt_ids = prompt_tokens.input_ids.to(device)
         
-        # Filter vocabulary for tiny model
-        prompt_ids = filter_vocab_for_tiny_model(prompt_ids, vocab_size=15000)
+        # Filter vocabulary for model
+        model_vocab_size = diffusion_model.encoder.get_vocab_size()
+        unk_token_id = tokenizer.unk_token_id if tokenizer.unk_token_id is not None else 100
+        prompt_ids = filter_vocab_for_model(prompt_ids, vocab_size=model_vocab_size, unk_token_id=unk_token_id)
         
         prompt_length = prompt_ids.shape[1]
         if prompt_length > 0:
-            prompt_latents = diffusion_model.embed_tokens(prompt_ids)
+            prompt_latents = diffusion_model.embed_tokens(prompt_ids, prompt_tokens.attention_mask.to(device))
             # Copy prompt latents to the beginning of our generation
             xt[:, :prompt_length] = prompt_latents
     
@@ -117,9 +118,9 @@ def diffusion_sample(
     for step_idx, t in enumerate(timesteps):
         t_scalar = t.item()
         
-        # Enable clamping in final 10% of steps
+        # Enable clamping in final 50% of steps
         step_progress = step_idx / (num_steps - 1)
-        current_use_clamping = use_clamping and (step_progress >= 0.9)
+        current_use_clamping = use_clamping and (step_progress >= 0.5)
         
         # Perform denoising step
         with torch.no_grad():
@@ -166,7 +167,7 @@ def diffusion_fill_blank(
     tokenizer,
     device,
     blank_marker="____",
-    num_steps=50,
+    num_steps=200,
     use_clamping=True,
     verbose=False
 ):
@@ -175,8 +176,8 @@ def diffusion_fill_blank(
     
     Args:
         text_with_blank: Text containing blank_marker to fill
-        diffusion_model: Trained BartDiffusionLM model  
-        tokenizer: BART tokenizer
+        diffusion_model: Trained DiffusionLM model  
+        tokenizer: BERT tokenizer
         device: Device to run on
         blank_marker: String marker for blanks (e.g., "____")
         num_steps: Number of denoising steps
@@ -190,81 +191,51 @@ def diffusion_fill_blank(
     if blank_marker not in text_with_blank:
         raise ValueError(f"No blank marker '{blank_marker}' found in text")
     
-    # Split text around blank
+    # Split text around blank to get the prefix as prompt
     parts = text_with_blank.split(blank_marker, 1)  # Split only on first occurrence
     prefix = parts[0].strip()
-    suffix = parts[1].strip() if len(parts) > 1 else ""
     
     if verbose:
-        print(f"🎯 Filling blank: prefix='{prefix}' suffix='{suffix}'")
+        print(f"🎯 Filling blank with prefix: '{prefix}'")
     
-    # For simplicity, we'll generate text with the prefix as a prompt
-    # and then try to match the pattern with the suffix
-    prompt_text = prefix if prefix else ""
-    
-    # Generate continuation
+    # Generate text using the prefix as a prompt
     result = diffusion_sample(
         diffusion_model=diffusion_model,
         tokenizer=tokenizer,
         device=device,
-        prompt_text=prompt_text,
+        prompt_text=prefix,
         total_length=64,
         num_steps=num_steps,
         use_clamping=use_clamping,
         verbose=verbose
     )
     
-    # Extract the generated part and combine with original text
-    generated_text = result['final_text']
-    
-    # Try to extract the blank-filling part
-    if prefix:
-        # Remove the prefix to get the generated continuation
-        if generated_text.startswith(prefix):
-            filled_part = generated_text[len(prefix):].strip()
-        else:
-            filled_part = generated_text
-    else:
-        filled_part = generated_text
-    
-    # Combine parts
-    if suffix:
-        final_text = f"{prefix} {filled_part} {suffix}".strip()
-    else:
-        final_text = f"{prefix} {filled_part}".strip()
-    
+    # Just return the denoised text directly
     return {
-        'final_text': final_text,
-        'filled_part': filled_part,
+        'final_text': result['final_text'],
         'intermediate_texts': result['intermediate_texts'],
         'timesteps': result['timesteps']
     }
 
 
 def load_trained_model(device, model_path="best_diffusion_lm_denoiser.pt"):
-    """Load the trained BartDiffusionLM model with tiny configuration."""
+    """Load the trained DiffusionLM model."""
     print(f"📥 Loading trained model from {model_path}...")
     
-    # Create tiny model configuration
-    tiny_config = create_tiny_bart_config()
-    
-    # Initialize model with tiny config
-    model = BartDiffusionLM(
-        bart_model_name="facebook/bart-base",  # Not used when custom_config provided
-        max_length=64,
-        time_embed_dim=256,
-        num_timesteps=2000,
-        dropout=0.1,
-        custom_config=tiny_config
-    ).to(device)
-    
-    # Load trained weights
-    success, epoch, val_loss = load_checkpoint(model, model_path, device)
-    if not success:
+    # Load model using the unified loading function
+    model, metadata, success = load_checkpoint(model_path, str(device))
+    if not success or model is None:
         print(f"❌ Model file {model_path} not found!")
         return None
     
-    print(f"✅ Model loaded successfully from epoch {epoch} (val_loss: {val_loss:.6f})")
+    # Check if metadata is available
+    if metadata is not None:
+        epoch = metadata.get('epoch', 'Unknown')
+        val_loss = metadata.get('best_val_loss', 'Unknown')
+        print(f"✅ Model loaded successfully from epoch {epoch} (val_loss: {val_loss:.6f})" if isinstance(val_loss, (int, float)) else f"✅ Model loaded successfully from epoch {epoch} (val_loss: {val_loss})")
+    else:
+        print(f"✅ Model loaded successfully (no metadata available)")
+    
     print(f"📊 Model parameters: {sum(p.numel() for p in model.parameters()):,}")
     model.eval()
     return model
@@ -288,7 +259,7 @@ def demonstrate_blank_filling(diffusion_model, tokenizer, device):
     
     print(f"🔍 Testing {len(test_examples)} blank-filling scenarios...")
     print(f"📋 Blank marker: '____'")
-    print(f"⚙️  Using 200 denoising steps with clamping enabled")
+    print(f"⚙️  Using 200 denoising steps with clamping enabled for final 50%")
     
     for i, example in enumerate(test_examples):
         print(f"\n{'─'*60}")
@@ -313,7 +284,6 @@ def demonstrate_blank_filling(diffusion_model, tokenizer, device):
             
             print(f"✅ RESULT (completed in {elapsed_time:.2f}s):")
             print(f"   🎯 Filled text: '{result['final_text']}'")
-            print(f"   🔧 Generated part: '{result['filled_part']}'")
             
         except Exception as e:
             print(f"❌ Error processing example: {e}")
@@ -337,7 +307,7 @@ def demonstrate_custom_prompting(diffusion_model, tokenizer, device, num_example
     selected_prompts = random.sample(prompts, min(num_examples, len(prompts)))
     
     print(f"🔍 Generating completions for {len(selected_prompts)} prompts...")
-    print(f"⚙️  Using 50 denoising steps with clamping")
+    print(f"⚙️  Using 200 denoising steps with clamping for final 50%")
     
     for i, prompt in enumerate(selected_prompts):
         print(f"\n{'─'*60}")
@@ -353,7 +323,7 @@ def demonstrate_custom_prompting(diffusion_model, tokenizer, device, num_example
                 device=device,
                 prompt_text=prompt,
                 total_length=64,
-                num_steps=50,
+                num_steps=200,
                 use_clamping=True,
                 verbose=False
             )
@@ -392,12 +362,12 @@ def analyze_tokenizer_for_blanks(tokenizer):
     encoded = tokenizer.encode(blank_marker, add_special_tokens=False)
     decoded = tokenizer.decode(encoded)
     print(f"   🔤 Blank marker '{blank_marker}' → tokens {encoded} → '{decoded}'")
-    print(f"   🎯 Tiny model vocab: Using first 15,000 tokens only")
+    print(f"   🎯 Model vocab: Using first 15,000 tokens only")
 
 
 def main():
     """Main demo function."""
-    print("🎯 BART DIFFUSION MODEL - BLANK FILLING DEMO")
+    print("🎯 DIFFUSION MODEL - BLANK FILLING DEMO")
     print("="*80)
     
     # Setup
@@ -405,8 +375,8 @@ def main():
     print(f"🖥️  Using device: {device}")
     
     # Load tokenizer
-    print("📚 Loading BART tokenizer...")
-    tokenizer = BartTokenizer.from_pretrained("facebook/bart-base")
+    print("📚 Loading BERT tokenizer...")
+    tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
     
     # Analyze tokenizer
     analyze_tokenizer_for_blanks(tokenizer)
@@ -422,7 +392,8 @@ def main():
     print(f"   • Parameters: {sum(p.numel() for p in diffusion_model.parameters()):,}")
     print(f"   • Max length: {diffusion_model.max_length}")
     print(f"   • Timesteps: {diffusion_model.scheduler.num_timesteps}")
-    print(f"   • Architecture: Tiny BART (384d, 3L, 15K vocab)")
+    print(f"   • Vocabulary: {diffusion_model.encoder.get_vocab_size():,} tokens")
+    print(f"   • Architecture: {diffusion_model.encoder_type.upper()} encoder")
     
     # Run demonstrations
     try:
@@ -444,7 +415,7 @@ def main():
     print("="*80)
     print("📝 Summary:")
     print("   • Demonstrated diffusion-based blank filling")
-    print("   • Used tiny BART configuration (11.6M parameters)")
+    print("   • Used unified DiffusionLM architecture")
     print("   • Applied clamping trick for discrete text generation")
     print("   • Showed iterative denoising process")
     print("   • Generated coherent text completions")

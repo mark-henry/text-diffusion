@@ -31,6 +31,7 @@ MODEL_CONFIGS = {
         "description": "Tiny (2.6M params)",
         "vocab_size": 15_000,
         "batch_size": 96,
+        "embedding_dim": 96,
         "d_model": 128,
         "encoder_layers": 1,
         "attention_heads": 2,
@@ -40,7 +41,8 @@ MODEL_CONFIGS = {
         "description": "Small (3.6M params)",
         "vocab_size": 22_000,
         "batch_size": 128,
-        "d_model": 160,
+        "embedding_dim": 128,
+        "d_model": 160, 
         "encoder_layers": 2,
         "attention_heads": 4,
         "sequence_length": 48,
@@ -49,7 +51,8 @@ MODEL_CONFIGS = {
         "description": "Medium (10-15.2M params)",
         "vocab_size": 30_000,
         "batch_size": 128,
-        "d_model": 256,
+        "embedding_dim": 128,
+        "d_model": 256, 
         "encoder_layers": 3,
         "attention_heads": 4,
         "sequence_length": 64,
@@ -58,7 +61,8 @@ MODEL_CONFIGS = {
         "description": "Large (bert-base 'actual size')",
         # "vocab_size": 30_000,
         "batch_size": 128,
-        "d_model": 768,
+        "embedding_dim": 128,
+        "d_model": 768, 
         "encoder_layers": 12,
         "attention_heads": 12,
         "sequence_length": 64,
@@ -72,6 +76,7 @@ ENCODER_CONFIGS = {
         "config_class": BartConfig,
         "model_name": "facebook/bart-base",
         "config_mapping": {
+            "embedding_dim": "embedding_dim",
             "d_model": "d_model",
             "encoder_layers": "encoder_layers", 
             "attention_heads": "encoder_attention_heads",
@@ -82,6 +87,7 @@ ENCODER_CONFIGS = {
         "config_class": BertConfig,
         "model_name": "bert-base-uncased",
         "config_mapping": {
+            "embedding_dim": "embedding_dim", 
             "d_model": "hidden_size",
             "encoder_layers": "num_hidden_layers",
             "attention_heads": "num_attention_heads",
@@ -167,6 +173,7 @@ def create_encoder_config(model_config: dict, encoder_type: str):
         encoder_specific_config['decoder_layers'] = model_config['encoder_layers']
         encoder_specific_config['decoder_attention_heads'] = model_config['attention_heads']
     elif encoder_type == "bert":
+        # For BERT, intermediate_size is typically 4x the transformer hidden size (d_model)
         encoder_specific_config['intermediate_size'] = model_config['d_model'] * 4
     
     return config_class(**encoder_specific_config)
@@ -174,6 +181,7 @@ def create_encoder_config(model_config: dict, encoder_type: str):
 def config_info(model):
     return {
         'vocab_size': model.config.vocab_size,
+        'embedding_dim': model.encoder.get_embedding_dim(),
         'd_model': model.encoder.get_latent_dim(),
         'encoder_layers': getattr(model.config, 'encoder_layers', getattr(model.config, 'num_hidden_layers', 1)),
         'max_length': model.max_length,
@@ -307,7 +315,78 @@ def compute_embedding_health_metrics(model, val_loader, device):
     return metrics
 
 
-def validate_model(model, val_loader, loss_fn, device, demo_example=None, tokenizer=None):
+def progressive_denoising_demo(model, tokenizer, device, num_steps=100, seq_len=32, seed=None):
+    """
+    Generate text from pure noise using progressive denoising.
+    
+    Args:
+        model: Trained DiffusionLM model
+        tokenizer: Tokenizer for decoding
+        device: Device to run on
+        num_steps: Number of denoising steps (default 100)
+        seq_len: Sequence length for generation
+        seed: Optional seed for reproducibility
+        
+    Returns:
+        Dict with generated text and metadata
+    """
+    model.eval()
+    
+    # Set seed for reproducibility
+    if seed is not None:
+        torch.manual_seed(seed)
+    
+    # Create random starting latents (pure noise)
+    embed_dim = model.embedding_dim  # Use embedding dimension
+    xt = torch.randn(1, seq_len, embed_dim, device=device)
+    
+    # Create attention mask (all positions are valid)
+    attention_mask = torch.ones(1, seq_len, device=device, dtype=torch.bool)
+    
+    # Create timestep schedule (from high noise to clean)
+    total_timesteps = model.scheduler.num_timesteps
+    if num_steps > total_timesteps:
+        num_steps = total_timesteps
+    
+    timesteps = torch.linspace(total_timesteps-1, 0, num_steps, dtype=torch.long, device=device)
+    
+    # Progressive denoising loop
+    with torch.no_grad():
+        for step_idx, t in enumerate(timesteps):
+            t_scalar = t.item()
+            
+            # Enable clamping in final 20% of steps for better discrete generation
+            step_progress = step_idx / (num_steps - 1)
+            use_clamping = step_progress >= 0.8
+            
+            # Import the diffusion sampling function
+            from denoiser import diffusion_sample_step
+            
+            # Perform one denoising step
+            xt, predicted_x0 = diffusion_sample_step(
+                xt, t_scalar, model, device, 
+                use_clamping=use_clamping, attention_mask=attention_mask
+            )
+    
+    # Decode final result to text
+    from denoiser import decode_latents_to_text
+    final_text = decode_latents_to_text(xt, model, tokenizer, attention_mask)
+    
+    # Calculate some metrics
+    final_magnitude = torch.norm(xt.reshape(1, -1), dim=1).item()
+    final_std = xt.std().item()
+    
+    return {
+        'generated_text': final_text,
+        'num_steps': num_steps,
+        'final_magnitude': final_magnitude,
+        'final_std': final_std,
+        'sequence_length': seq_len,
+        'seed': seed
+    }
+
+
+def validate_model(model, val_loader, loss_fn, device, tokenizer=None):
     """Validate the model with the new Diffusion-LM loss."""
     model.eval()
     val_total_loss = 0
@@ -495,30 +574,43 @@ def validate_model(model, val_loader, loss_fn, device, demo_example=None, tokeni
         "embeddings/least_used_tokens": embedding_metrics['least_used_tokens'],
     })
     
-    # Demo denoising during validation
-    if demo_example and tokenizer:
+    # Progressive denoising demo during validation
+    if tokenizer:
         try:
-            print(f"\n🎭 VALIDATION DEMO - Denoising at timestep 1:")
-            demo_result = demo_denoising_step(
-                demo_example, model, tokenizer, device, timestep=1
+            print(f"\n🎭 VALIDATION DEMO - Progressive Text Generation:")
+            
+            # Use sequence length from model config, with a reasonable default
+            demo_seq_len = getattr(model, 'max_length', 32)
+            demo_seq_len = min(demo_seq_len, 48)  # Cap at 48 for faster generation
+            
+            demo_result = progressive_denoising_demo(
+                model=model, 
+                tokenizer=tokenizer, 
+                device=device, 
+                num_steps=100, 
+                seq_len=demo_seq_len,
+                seed=42  # Fixed seed for consistent demo across epochs
             )
             
-            print(f"   📝 Original: {demo_result['original_text']}")
-            print(f"   🟢 Denoised: {demo_result['denoised_text']}")
-            print(f"   📊 Cosine Similarity: {demo_result['cosine_similarity']:.4f}")
+            print(f"   🎲 Generated from pure noise (100 steps, seq_len={demo_seq_len}):")
+            print(f"   🟢 Generated Text: '{demo_result['generated_text']}'")
+            print(f"   📊 Final Magnitude: {demo_result['final_magnitude']:.3f}")
+            print(f"   📊 Final Std: {demo_result['final_std']:.3f}")
             
-            # Log demo to wandb
+            # Log progressive demo to wandb
             wandb.log({
-                "demo/original_text": demo_result['original_text'],
-                "demo/noisy_text": demo_result['noisy_text'], 
-                "demo/denoised_text": demo_result['denoised_text'],
-                "demo/noise_percentage": demo_result['noise_percentage'],
-                "demo/cosine_similarity": demo_result['cosine_similarity'],
-                "demo/timestep": demo_result['timestep']
+                "progressive_demo/generated_text": demo_result['generated_text'],
+                "progressive_demo/num_steps": demo_result['num_steps'],
+                "progressive_demo/final_magnitude": demo_result['final_magnitude'],
+                "progressive_demo/final_std": demo_result['final_std'],
+                "progressive_demo/sequence_length": demo_result['sequence_length'],
+                "progressive_demo/seed": demo_result['seed']
             })
             
         except Exception as e:
-            print(f"⚠️ Demo failed: {e}")
+            print(f"⚠️ Progressive demo failed: {e}")
+            import traceback
+            print(f"Full traceback: {traceback.format_exc()}")
     
     return avg_total_loss, avg_cosine_sim, avg_magnitude_ratio, embedding_metrics
 
@@ -714,13 +806,6 @@ def train_denoiser(
     
     print(f"🚀 Starting Diffusion-LM training from epoch {start_epoch} (patience {patience})")
     
-    # select demo example from train loader
-    demo_batch = next(iter(train_loader))
-    demo_example = {
-        'input_ids': demo_batch['input_ids'][1],  # Take an example from batch
-        'attention_mask': demo_batch['attention_mask'][1]
-    }
-    
     epoch = start_epoch
     while True:
         # Update training state for current epoch
@@ -816,7 +901,7 @@ def train_denoiser(
         # Validation
         val_loss, val_cosine_sim, val_magnitude_ratio, embedding_metrics = validate_model(
             model, val_loader, diffusion_lm_loss, device, 
-            demo_example=demo_example, tokenizer=tokenizer
+            tokenizer=tokenizer
         )
         
         # Update training state with current validation metrics
@@ -1060,7 +1145,7 @@ def load_checkpoint(checkpoint_path: str, device: Optional[str] = None) -> Tuple
         if config_info is None:
             raise ValueError("Cannot detect model configuration, no model configuration present")
         
-        print(f"🤖 Using model with config: d_model={config_info['d_model']}, layers={config_info['encoder_layers']}, vocab={config_info['vocab_size']}")
+        print(f"🤖 Using model with config: embedding_dim={config_info['embedding_dim']}, d_model={config_info['d_model']}, layers={config_info['encoder_layers']}, vocab={config_info['vocab_size']}")
         
         # Create the model - detect encoder type from state_dict if not in config
         encoder_type = config_info.get('encoder_type')

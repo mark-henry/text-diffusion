@@ -45,6 +45,11 @@ class BaseEncoder(nn.Module, ABC):
         pass
     
     @abstractmethod
+    def get_embedding_dim(self) -> int:
+        """Get the embedding dimension (before projection to transformer hidden size)."""
+        pass
+    
+    @abstractmethod
     def get_vocab_size(self) -> int:
         """Get the vocabulary size."""
         pass

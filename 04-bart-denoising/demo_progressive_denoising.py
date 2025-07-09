@@ -74,9 +74,10 @@ def progressive_denoising_demo(
         print(f"❌ Unsupported encoder type: {model.encoder_type}")
         return None, "Unsupported encoder type"
     
-    # Get model dimensions
-    embed_dim = model.encoder.get_latent_dim()
-    print(f"📏 Model dimensions: seq_len={seq_len}, embed_dim={embed_dim}")
+    # Get model dimensions - use embedding dimension for progressive denoising
+    embed_dim = model.encoder.get_embedding_dim()  # Work in embedding space, not transformer hidden space
+    print(f"📏 Model dimensions: seq_len={seq_len}, embed_dim={embed_dim} (embedding space)")
+    print(f"   Transformer hidden dim: {model.encoder.get_latent_dim()}")
     
     # Create random starting latents (pure noise)
     print("🎲 Creating random starting latents...")
@@ -172,7 +173,7 @@ if __name__ == "__main__":
 
     parser.add_argument("--model", type=str, default="best_diffusion_lm_denoiser.pt",
                        help="Path to model checkpoint")
-    parser.add_argument("--steps", type=int, default=20,
+    parser.add_argument("--steps", type=int, default=200,
                        help="Number of denoising steps")
     parser.add_argument("--length", type=int, default=64,
                        help="Sequence length")

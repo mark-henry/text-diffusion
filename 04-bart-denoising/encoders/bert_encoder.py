@@ -33,6 +33,11 @@ class BertEncoder(BaseEncoder):
         self.config.hidden_dropout_prob = self.dropout
         self.config.attention_probs_dropout_prob = self.dropout
         
+        # Extract dimensions
+        self.embedding_dim = getattr(self.config, 'embedding_dim', self.config.hidden_size)  # Fallback to hidden_size if not specified
+        self.transformer_hidden_dim = self.config.hidden_size  # Transformer hidden dimension
+        self.vocab_size = self.config.vocab_size
+        
         # Load or create BERT model
         if self.custom_config is not None:
             # Create new model with custom config (randomly initialized)
@@ -50,21 +55,30 @@ class BertEncoder(BaseEncoder):
         # Keep only the encoder layers
         self.encoder_layers = temp_bert.encoder
         
-        # Create custom embedding layers following reference implementation
-        print("   Creating custom embedding layers...")
-        self.latent_dim = self.config.hidden_size
-        self.vocab_size = self.config.vocab_size
-        
         # Custom word embeddings (trainable)
-        self.word_embeddings = nn.Embedding(self.vocab_size, self.latent_dim)
+        self.word_embeddings = nn.Embedding(self.vocab_size, self.embedding_dim)
         
         # Custom positional embeddings following reference implementation
         self.register_buffer("position_ids", torch.arange(self.config.max_position_embeddings).expand((1, -1)))
-        self.position_embeddings = nn.Embedding(self.config.max_position_embeddings, self.latent_dim)
+        self.position_embeddings = nn.Embedding(self.config.max_position_embeddings, self.embedding_dim)
         
-        # Layer normalization and dropout
-        self.layer_norm = nn.LayerNorm(self.latent_dim, eps=self.config.layer_norm_eps)
+        # Layer normalization and dropout for embedding space
+        self.layer_norm = nn.LayerNorm(self.embedding_dim, eps=self.config.layer_norm_eps)
         self.embedding_dropout = nn.Dropout(self.dropout)
+        
+        # Input up-projection: embedding space -> transformer hidden space
+        self.input_up_proj = nn.Sequential(
+            nn.Linear(self.embedding_dim, self.transformer_hidden_dim),
+            nn.Tanh(), 
+            nn.Linear(self.transformer_hidden_dim, self.transformer_hidden_dim)
+        )
+        
+        # Output down-projection: transformer hidden space -> embedding space
+        self.output_down_proj = nn.Sequential(
+            nn.Linear(self.transformer_hidden_dim, self.transformer_hidden_dim),
+            nn.Tanh(), 
+            nn.Linear(self.transformer_hidden_dim, self.embedding_dim)
+        )
         
         # Ensure max_length doesn't exceed BERT's position embedding limit
         max_pos_embeds = self.config.max_position_embeddings
@@ -76,8 +90,12 @@ class BertEncoder(BaseEncoder):
         self.report_trainable_parameters()
         
     def get_latent_dim(self) -> int:
-        """Get the latent dimension of the encoder."""
-        return self.latent_dim
+        """Get the latent dimension of the encoder (transformer hidden dimension)."""
+        return self.transformer_hidden_dim
+    
+    def get_embedding_dim(self) -> int:
+        """Get the embedding dimension (before projection to transformer hidden size)."""
+        return self.embedding_dim
     
     def get_vocab_size(self) -> int:
         """Get the vocabulary size."""
@@ -138,17 +156,13 @@ class BertEncoder(BaseEncoder):
         """
         Convert hidden states to vocabulary logits using weight tying.
         
-        This implements weight tying by using the same weight matrix for both
-        embedding lookup and output projection.
-        
         Args:
-            hidden_states: [B, L, C] hidden representations
+            hidden_states: [B, L, embedding_dim] hidden representations in embedding space
             
         Returns:
             logits: [B, L, vocab_size] vocabulary logits
         """
         # Weight tying: use embedding weights as output projection
-        # This is the key mechanism that prevents embedding collapse
         embed_weight = self.word_embeddings.weight
         assert isinstance(embed_weight, torch.Tensor), "Expected embedding weight to be a tensor"
         return F.linear(hidden_states, embed_weight)
@@ -158,37 +172,46 @@ class BertEncoder(BaseEncoder):
         Get the embedding weight matrix for clamping.
         
         Returns:
-            Embedding weights [vocab_size, latent_dim]
+            Embedding weights [vocab_size, embedding_dim]
         """
-        return self.word_embeddings.weight
+        weight = self.word_embeddings.weight
+        assert isinstance(weight, torch.Tensor), "Expected embedding weight to be a tensor"
+        return weight
         
     def forward_encoder(self, inputs_embeds: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
         """
         Forward pass through the BERT encoder.
         
         Args:
-            inputs_embeds: Input embeddings [B, L, C]
+            inputs_embeds: Input embeddings [B, L, embedding_dim] in embedding space
             attention_mask: Attention mask [B, L]
             
         Returns:
-            Encoder output [B, L, C]
+            Encoder output [B, L, embedding_dim] projected back to embedding space
         """
+        # Project from embedding space to transformer hidden space
+        projected_inputs = self.input_up_proj(inputs_embeds)  # [B, L, transformer_hidden_dim]
+        
         # Convert attention mask to the format expected by BERT
         # BERT expects 1 for valid tokens, 0 for padding
         extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
-        extended_attention_mask = extended_attention_mask.to(dtype=inputs_embeds.dtype)
+        extended_attention_mask = extended_attention_mask.to(dtype=projected_inputs.dtype)
         extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
         
         # Process through BERT encoder layers
         encoder_outputs = self.encoder_layers(
-            inputs_embeds,
+            projected_inputs,
             attention_mask=extended_attention_mask,
             output_attentions=False,
             output_hidden_states=False,
             return_dict=True
         )
         
-        return encoder_outputs.last_hidden_state
+        # Project back from transformer hidden space to embedding space
+        hidden_states = encoder_outputs.last_hidden_state  # [B, L, transformer_hidden_dim]
+        output_embeddings = self.output_down_proj(hidden_states)  # [B, L, embedding_dim]
+        
+        return output_embeddings
     
     def report_trainable_parameters(self):
         """Report the number of trainable parameters."""
@@ -197,12 +220,20 @@ class BertEncoder(BaseEncoder):
         pos_embed_params = sum(p.numel() for p in self.position_embeddings.parameters() if p.requires_grad)
         layer_norm_params = sum(p.numel() for p in self.layer_norm.parameters() if p.requires_grad)
         
+        # Count projection layer parameters
+        input_proj_params = sum(p.numel() for p in self.input_up_proj.parameters() if p.requires_grad)
+        output_proj_params = sum(p.numel() for p in self.output_down_proj.parameters() if p.requires_grad)
+        
         # Count encoder parameters
         encoder_params = sum(p.numel() for p in self.encoder_layers.parameters() if p.requires_grad)
         
         total_custom_embed = word_embed_params + pos_embed_params + layer_norm_params
+        total_projections = input_proj_params + output_proj_params
+        
         print(f"✅ Custom embedding layers trainable ({total_custom_embed:,} trainable params)")
         print(f"   - Word embeddings: {word_embed_params:,}")
         print(f"   - Position embeddings: {pos_embed_params:,}")
         print(f"   - Layer norm: {layer_norm_params:,}")
+        print(f"   - Input up-projection: {input_proj_params:,}")
+        print(f"   - Output down-projection: {output_proj_params:,}")
         print(f"✅ BERT encoder layers trainable ({encoder_params:,} trainable params)") 
