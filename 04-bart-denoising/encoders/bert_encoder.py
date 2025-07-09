@@ -1,5 +1,6 @@
 from typing import Optional
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from transformers import BertModel, BertConfig
 from .base_encoder import BaseEncoder
@@ -9,8 +10,10 @@ class BertEncoder(BaseEncoder):
     """
     BERT encoder implementation for diffusion language models.
     
-    Encapsulates BERT-specific functionality and provides a unified interface
-    through the BaseEncoder abstract class.
+    Follows the reference implementation by:
+    1. Removing built-in BERT embeddings and pooler
+    2. Using custom positional embeddings 
+    3. Excluding [CLS] tokens from training targets
     """
     
     def __init__(self, model_name: str = "bert-base-uncased", max_length: int = 64, 
@@ -19,7 +22,7 @@ class BertEncoder(BaseEncoder):
         self.load_model()
         
     def load_model(self):
-        """Load and initialize the BERT model."""
+        """Load and initialize the BERT model following reference implementation."""
         # Load BERT model and extract components
         if self.custom_config is not None:
             self.config = self.custom_config
@@ -34,13 +37,34 @@ class BertEncoder(BaseEncoder):
         if self.custom_config is not None:
             # Create new model with custom config (randomly initialized)
             print("   Creating new BERT model with random initialization...")
-            self.model = BertModel(config=self.custom_config)
+            temp_bert = BertModel(config=self.custom_config)
         else:
             # Load pretrained model
-            self.model = BertModel.from_pretrained(self.model_name, config=self.config)
+            temp_bert = BertModel.from_pretrained(self.model_name, config=self.config)
 
+        # Following reference implementation: delete built-in embeddings and pooler
+        print("   Removing BERT's built-in embeddings and pooler...")
+        del temp_bert.embeddings
+        del temp_bert.pooler
+        
+        # Keep only the encoder layers
+        self.encoder_layers = temp_bert.encoder
+        
+        # Create custom embedding layers following reference implementation
+        print("   Creating custom embedding layers...")
         self.latent_dim = self.config.hidden_size
         self.vocab_size = self.config.vocab_size
+        
+        # Custom word embeddings (trainable)
+        self.word_embeddings = nn.Embedding(self.vocab_size, self.latent_dim)
+        
+        # Custom positional embeddings following reference implementation
+        self.register_buffer("position_ids", torch.arange(self.config.max_position_embeddings).expand((1, -1)))
+        self.position_embeddings = nn.Embedding(self.config.max_position_embeddings, self.latent_dim)
+        
+        # Layer normalization and dropout
+        self.layer_norm = nn.LayerNorm(self.latent_dim, eps=self.config.layer_norm_eps)
+        self.embedding_dropout = nn.Dropout(self.dropout)
         
         # Ensure max_length doesn't exceed BERT's position embedding limit
         max_pos_embeds = self.config.max_position_embeddings
@@ -48,9 +72,6 @@ class BertEncoder(BaseEncoder):
             print(f"Warning: max_length {self.max_length} exceeds BERT's max_position_embeddings {max_pos_embeds}")
             self.max_length = min(self.max_length, max_pos_embeds - 2)  # -2 for safety margin
             print(f"Adjusted max_length to {self.max_length}")
-        
-        # BERT is encoder-only, so we don't need to remove decoder like we did with BART
-        # All BERT parameters are trainable by default
         
         self.report_trainable_parameters()
         
@@ -72,8 +93,12 @@ class BertEncoder(BaseEncoder):
         
     def embed_tokens(self, input_ids: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
-        Compute clean latents from token IDs using BERT encoder.
-        This method gets the target embeddings that the diffusion model should predict.
+        Compute clean latents from token IDs using custom embeddings.
+        
+        Following reference implementation:
+        1. Use custom word + positional embeddings
+        2. Apply layer norm and dropout
+        3. No special token handling needed (add_special_tokens=False used consistently)
         """
         batch_size, seq_len = input_ids.shape
         
@@ -90,17 +115,24 @@ class BertEncoder(BaseEncoder):
         else:
             attention_mask = attention_mask.bool()
         
-        # Use BERT encoder directly with input_ids (this handles positional embeddings automatically)
-        encoder_outputs = self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            output_attentions=False,
-            output_hidden_states=False,
-            return_dict=True
-        )
+        # No need to check for [CLS] tokens since we use add_special_tokens=False consistently
         
-        # Return the encoder's hidden state as our target clean latents
-        return encoder_outputs.last_hidden_state
+        # Custom embedding computation following reference implementation
+        # 1. Word embeddings
+        word_embeds = self.word_embeddings(input_ids)
+        
+        # 2. Positional embeddings
+        position_ids = torch.arange(seq_len, device=input_ids.device, dtype=torch.long).unsqueeze(0).expand(batch_size, -1)
+        position_embeds = self.position_embeddings(position_ids)
+        
+        # 3. Combine embeddings
+        embeddings = word_embeds + position_embeds
+        
+        # 4. Layer normalization and dropout
+        embeddings = self.layer_norm(embeddings)
+        embeddings = self.embedding_dropout(embeddings)
+        
+        return embeddings
 
     def get_vocab_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """
@@ -117,7 +149,7 @@ class BertEncoder(BaseEncoder):
         """
         # Weight tying: use embedding weights as output projection
         # This is the key mechanism that prevents embedding collapse
-        embed_weight = self.model.embeddings.word_embeddings.weight
+        embed_weight = self.word_embeddings.weight
         assert isinstance(embed_weight, torch.Tensor), "Expected embedding weight to be a tensor"
         return F.linear(hidden_states, embed_weight)
     
@@ -128,10 +160,7 @@ class BertEncoder(BaseEncoder):
         Returns:
             Embedding weights [vocab_size, latent_dim]
         """
-        full_vocab_embeddings = self.model.embeddings.word_embeddings.weight  # [full_vocab_size, embed_dim]
-        model_vocab_size = self.config.vocab_size
-        vocab_embeddings = full_vocab_embeddings[:model_vocab_size]  # [model_vocab_size, embed_dim]
-        return vocab_embeddings
+        return self.word_embeddings.weight
         
     def forward_encoder(self, inputs_embeds: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
         """
@@ -144,10 +173,16 @@ class BertEncoder(BaseEncoder):
         Returns:
             Encoder output [B, L, C]
         """
-        # Process through BERT encoder using inputs_embeds
-        encoder_outputs = self.model(
-            inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
+        # Convert attention mask to the format expected by BERT
+        # BERT expects 1 for valid tokens, 0 for padding
+        extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
+        extended_attention_mask = extended_attention_mask.to(dtype=inputs_embeds.dtype)
+        extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
+        
+        # Process through BERT encoder layers
+        encoder_outputs = self.encoder_layers(
+            inputs_embeds,
+            attention_mask=extended_attention_mask,
             output_attentions=False,
             output_hidden_states=False,
             return_dict=True
@@ -157,9 +192,17 @@ class BertEncoder(BaseEncoder):
     
     def report_trainable_parameters(self):
         """Report the number of trainable parameters."""
-        # Count and report trainable parameters
-        embedding_params = sum(p.numel() for p in self.model.embeddings.parameters() if p.requires_grad)
-        encoder_params = sum(p.numel() for p in self.model.encoder.parameters() if p.requires_grad)
+        # Count custom embedding parameters
+        word_embed_params = sum(p.numel() for p in self.word_embeddings.parameters() if p.requires_grad)
+        pos_embed_params = sum(p.numel() for p in self.position_embeddings.parameters() if p.requires_grad)
+        layer_norm_params = sum(p.numel() for p in self.layer_norm.parameters() if p.requires_grad)
         
-        print(f"✅ BERT embedding layers trainable ({embedding_params:,} trainable params)")
+        # Count encoder parameters
+        encoder_params = sum(p.numel() for p in self.encoder_layers.parameters() if p.requires_grad)
+        
+        total_custom_embed = word_embed_params + pos_embed_params + layer_norm_params
+        print(f"✅ Custom embedding layers trainable ({total_custom_embed:,} trainable params)")
+        print(f"   - Word embeddings: {word_embed_params:,}")
+        print(f"   - Position embeddings: {pos_embed_params:,}")
+        print(f"   - Layer norm: {layer_norm_params:,}")
         print(f"✅ BERT encoder layers trainable ({encoder_params:,} trainable params)") 

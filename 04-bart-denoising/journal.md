@@ -923,6 +923,55 @@ Basically the same results. It's time to try bert instead of bart
 
 yes YES
 
-now bigger (15M params)
+now bigger (10M params)
 
-#2025-07-06
+# 2025-07-06
+
+Trained "medium" size model 10M params 5 epochs 20 minutes each on an H100 for $2
+
+Multiple issues discovered! Every block in the demo starts with "the" before continuing on with the rest of the text. 
+
+### 1. [CLS] Token Contamination
+- **Problem**: BERT tokenizer adds [CLS] tokens (ID 101) at position 0 during validation demo
+- **Effect**: Model trained to predict [CLS] → "the" mappings, corrupting sequence alignment
+- **Solution**: Skip [CLS] tokens in training targets by shifting sequences left and padding right
+
+### 2. Improper Attention Masking
+- **Problem**: Loss functions didn't properly exclude padding tokens from gradients
+- **Effect**: Model trained on meaningless padding token predictions
+- **Solution**: Apply attention masks consistently across all loss components
+
+### 3. Architectural Dependencies
+- **Problem**: Using full BERT model with built-in embeddings vs. reference implementation
+- **Effect**: Different positional embedding behavior than intended design
+- **Solution**: Follow reference implementation - delete BERT embeddings/pooler, use custom embeddings
+
+### 4. Cosine Similarity Masking
+- **Problem**: High cosine similarity between shifted sequences misleading during validation
+- **Effect**: Masked the severity of the sequence offset problem
+- **Solution**: Compute metrics only over valid (non-padding) tokens
+
+Changed from using bert positional embeddings (does it have positional embeddings built in?) to rolling our own.
+
+# 2025-07-08
+
+Results:
+
+Our best-ever similarity results across the noise schedule
+
+```
+📊 PERFORMANCE RESULTS:
+Timestep | Noise%  | Cosine Sim ± Std  | Mag Ratio ± Std | Quality
+---------------------------------------------------------------------------
+   t=   0 |   0.0% | 0.9983 ± 0.0002 | 1.0359 ± 0.0100 | 🟢 Excellent
+   t=   1 |   2.4% | 0.9982 ± 0.0001 | 1.0371 ± 0.0090 | 🟢 Excellent
+   t=   5 |   5.1% | 0.9984 ± 0.0001 | 1.0528 ± 0.0064 | 🟢 Excellent
+   t=  10 |   7.1% | 0.9981 ± 0.0001 | 1.0512 ± 0.0067 | 🟢 Excellent
+   t=  50 |  15.8% | 0.9967 ± 0.0003 | 1.0501 ± 0.0071 | 🟢 Excellent
+   t= 100 |  22.4% | 0.9956 ± 0.0005 | 1.0504 ± 0.0067 | 🟢 Excellent
+   t= 500 |  50.0% | 0.9888 ± 0.0016 | 1.0534 ± 0.0067 | 🟢 Excellent
+   t=1000 |  70.7% | 0.9769 ± 0.0037 | 1.0454 ± 0.0077 | 🟢 Excellent
+   t=1500 |  86.6% | 0.9486 ± 0.0097 | 1.0174 ± 0.0138 | 🟢 Excellent
+   t=1900 |  97.5% | 0.7388 ± 0.0319 | 0.6715 ± 0.0542 | 🟡 Good
+```
+

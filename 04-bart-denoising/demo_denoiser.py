@@ -1,7 +1,7 @@
 from typing import Optional
 import torch
 import torch.nn.functional as F
-from transformers import BartTokenizer
+from transformers import BartTokenizer, BertTokenizer
 from datasets import load_dataset
 import random
 import numpy as np
@@ -62,7 +62,7 @@ def test_model_performance(diffusion_model, tokenizer, device, num_samples=10):
         for text in test_texts:
             # Encode text exactly like training
             inputs = tokenizer(text, return_tensors="pt", max_length=64, 
-                            truncation=True, padding="max_length")
+                            truncation=True, padding="max_length", add_special_tokens=False)
             
             # Filter vocabulary to match model's vocab_size (same as in demo_denoising_step)
             input_ids = inputs['input_ids']
@@ -194,7 +194,7 @@ def demonstrate_denoising_examples(diffusion_model, tokenizer, device, num_examp
         for i, noise_level in enumerate(noise_levels):
             # Create example dictionary from text (like training pipeline)
             inputs = tokenizer(original_text, return_tensors="pt", max_length=64, 
-                              truncation=True, padding="max_length")
+                              truncation=True, padding="max_length", add_special_tokens=False)
             
             # Filter vocabulary to match model's vocab_size
             input_ids = inputs['input_ids']
@@ -238,19 +238,27 @@ def main():
     
     # Setup
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"🚀 BART Diffusion Model Demo")
     print(f"Using device: {device}")
     print(f"Checkpoint: {args.checkpoint}")
     
-    # Load models
-    print("\nLoading BART tokenizer...")
-    tokenizer = BartTokenizer.from_pretrained("facebook/bart-base")
-    
-    # Load trained diffusion model
+    # Load trained diffusion model first
     diffusion_model = load_model(device, args.checkpoint)
     if diffusion_model is None:
         print("Failed to load trained model! Make sure you've run training first.")
         return
+    
+    print(f"🚀 {diffusion_model.encoder_type.upper()} Diffusion Model Demo")
+    
+    # Load appropriate tokenizer based on model's encoder type
+    print("\nLoading tokenizer...")
+    if diffusion_model.encoder_type == "bart":
+        print("Loading BART tokenizer...")
+        tokenizer = BartTokenizer.from_pretrained("facebook/bart-base")
+    elif diffusion_model.encoder_type == "bert":
+        print("Loading BERT tokenizer...")
+        tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
+    else:
+        raise ValueError(f"Unsupported encoder type: {diffusion_model.encoder_type}")
     
     print(f"\n🎯 Model successfully loaded! Ready to demonstrate denoising capabilities.")
     print(f"\n📊 MODEL METADATA")

@@ -137,7 +137,7 @@ class TextDataset(Dataset):
     
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         text = self.dataset[idx]
-        inputs = self.tokenizer(text, return_tensors="pt", max_length=self.max_length, truncation=True, padding="max_length")
+        inputs = self.tokenizer(text, return_tensors="pt", max_length=self.max_length, truncation=True, padding="max_length", add_special_tokens=False)
         
         input_ids = inputs.input_ids.squeeze(0)  # Remove batch dimension
         attention_mask = inputs.attention_mask.squeeze(0)
@@ -314,7 +314,7 @@ def encode_text_to_latents(text, model: DiffusionLM, tokenizer, device, max_leng
     """Encode text to embeddings"""
     # Tokenize
     inputs = tokenizer(text, return_tensors="pt", max_length=max_length, 
-                      truncation=True, padding="max_length")
+                      truncation=True, padding="max_length", add_special_tokens=False)
     inputs = {k: v.to(device) for k, v in inputs.items()}
     
     with torch.no_grad():
@@ -470,10 +470,10 @@ def compute_cosine_distances(pred_flat, vocab_embeddings):
 
 def clamp_to_embeddings(predicted_x0, diffusion_model, attention_mask=None):
     """
-    Clamp predicted latents to nearest word embeddings using L2 distance (the "clamping trick").
+    Clamp predicted latents to nearest word embeddings using cosine similarity.
     
-    Following the reference Diffusion-LM implementation which uses
-    L2 distance rather than cosine similarity for better magnitude sensitivity.
+    Using cosine similarity instead of L2 distance to handle magnitude differences
+    between processed hidden states and raw embedding weights.
     
     Args:
         predicted_x0: [B, L, C] predicted clean latents
@@ -492,7 +492,8 @@ def clamp_to_embeddings(predicted_x0, diffusion_model, attention_mask=None):
     # Reshape for batch computation
     pred_flat = predicted_x0.view(-1, embed_dim)  # [B*L, embed_dim]
     
-    distances = compute_l2_distances(pred_flat, vocab_embeddings)
+    # Use cosine similarity instead of L2 distance
+    distances = compute_cosine_distances(pred_flat, vocab_embeddings)
     
     # Find nearest embedding (minimum distance)
     nearest_indices = torch.argmin(distances, dim=1)  # [B*L]

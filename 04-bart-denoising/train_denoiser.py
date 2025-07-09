@@ -53,6 +53,15 @@ MODEL_CONFIGS = {
         "encoder_layers": 3,
         "attention_heads": 4,
         "sequence_length": 64,
+    },
+    "large": {
+        "description": "Large (bert-base 'actual size')",
+        # "vocab_size": 30_000,
+        "batch_size": 128,
+        "d_model": 768,
+        "encoder_layers": 12,
+        "attention_heads": 12,
+        "sequence_length": 64,
     }
 }
 
@@ -306,12 +315,12 @@ def validate_model(model, val_loader, loss_fn, device, demo_example=None, tokeni
     val_magnitude_ratio = 0
     
     # Track individual loss components for corrected loss function
-    val_diffusion_loss = 0
-    val_embedding_loss = 0
-    val_reconstruction_loss = 0
-    val_diffusion_loss_weighted = 0
-    val_embedding_loss_weighted = 0
-    val_reconstruction_loss_weighted = 0
+    val_mse_loss = 0
+    val_tT_loss = 0
+    val_decoder_nll = 0
+    val_mse_loss_weighted = 0
+    val_tT_loss_weighted = 0
+    val_decoder_nll_weighted = 0
     val_t0_samples = 0
     
     num_batches = 0
@@ -344,12 +353,12 @@ def validate_model(model, val_loader, loss_fn, device, demo_example=None, tokeni
             val_magnitude_ratio += loss_dict['magnitude_ratio'].item()
             
             # Track individual loss components (corrected for new loss function)
-            val_diffusion_loss += loss_dict['diffusion_loss'].item()
-            val_embedding_loss += loss_dict['embedding_loss'].item()
-            val_reconstruction_loss += loss_dict['reconstruction_loss'].item()
-            val_diffusion_loss_weighted += loss_dict['diffusion_loss_weighted'].item()
-            val_embedding_loss_weighted += loss_dict['embedding_loss_weighted'].item()
-            val_reconstruction_loss_weighted += loss_dict['reconstruction_loss_weighted'].item()
+            val_mse_loss += loss_dict['mse_loss'].item()
+            val_tT_loss += loss_dict['tT_loss'].item()
+            val_decoder_nll += loss_dict['decoder_nll'].item()
+            val_mse_loss_weighted += loss_dict['mse_loss_weighted'].item()
+            val_tT_loss_weighted += loss_dict['tT_loss_weighted'].item()
+            val_decoder_nll_weighted += loss_dict['decoder_nll_weighted'].item()
             
             # Track t=0 metrics
             val_t0_samples += loss_dict['t0_samples']
@@ -410,32 +419,32 @@ def validate_model(model, val_loader, loss_fn, device, demo_example=None, tokeni
     avg_magnitude_ratio = val_magnitude_ratio / num_batches
     
     # Calculate average loss components (corrected)
-    avg_diffusion_loss = val_diffusion_loss / num_batches
-    avg_embedding_loss = val_embedding_loss / num_batches
-    avg_reconstruction_loss = val_reconstruction_loss / num_batches
-    avg_diffusion_loss_weighted = val_diffusion_loss_weighted / num_batches
-    avg_embedding_loss_weighted = val_embedding_loss_weighted / num_batches
-    avg_reconstruction_loss_weighted = val_reconstruction_loss_weighted / num_batches
+    avg_mse_loss = val_mse_loss / num_batches
+    avg_tT_loss = val_tT_loss / num_batches
+    avg_decoder_nll = val_decoder_nll / num_batches
+    avg_mse_loss_weighted = val_mse_loss_weighted / num_batches
+    avg_tT_loss_weighted = val_tT_loss_weighted / num_batches
+    avg_decoder_nll_weighted = val_decoder_nll_weighted / num_batches
     avg_t0_samples = val_t0_samples / num_batches
     
     # Calculate loss component percentages (corrected)
-    total_weighted = (avg_diffusion_loss_weighted + avg_embedding_loss_weighted + avg_reconstruction_loss_weighted)
+    total_weighted = (avg_mse_loss_weighted + avg_tT_loss_weighted + avg_decoder_nll_weighted)
     
     if total_weighted > 0:
-        diffusion_pct = (avg_diffusion_loss_weighted / total_weighted) * 100
-        embedding_pct = (avg_embedding_loss_weighted / total_weighted) * 100
-        reconstruction_pct = (avg_reconstruction_loss_weighted / total_weighted) * 100
+        mse_pct = (avg_mse_loss_weighted / total_weighted) * 100
+        tT_pct = (avg_tT_loss_weighted / total_weighted) * 100
+        decoder_pct = (avg_decoder_nll_weighted / total_weighted) * 100
     else:
-        diffusion_pct = embedding_pct = reconstruction_pct = 0
+        mse_pct = tT_pct = decoder_pct = 0
     
     # Print detailed loss component analysis (corrected)
-    print(f"\n🔍 VALIDATION LOSS COMPONENT ANALYSIS (t=0 Corrected):")
+    print(f"\n🔍 VALIDATION LOSS COMPONENT ANALYSIS (Corrected Implementation):")
     print(f"   📊 Total Loss: {avg_total_loss:.6f}")
     print(f"   🎯 t=0 Samples per batch: {avg_t0_samples:.1f}")
     print(f"   ⚖️  Loss Component Breakdown:")
-    print(f"      🎯 Diffusion (w/ t=0): {avg_diffusion_loss:.6f} → {avg_diffusion_loss_weighted:.6f} ({diffusion_pct:.1f}%)")
-    print(f"      🔗 Embedding (t=0):    {avg_embedding_loss:.6f} → {avg_embedding_loss_weighted:.6f} ({embedding_pct:.1f}%)")
-    print(f"      📝 Reconstruction:     {avg_reconstruction_loss:.6f} → {avg_reconstruction_loss_weighted:.6f} ({reconstruction_pct:.1f}%)")
+    print(f"      🎯 MSE (w/ t=0):       {avg_mse_loss:.6f} → {avg_mse_loss_weighted:.6f} ({mse_pct:.1f}%)")
+    print(f"      🌊 tT_loss (prior):    {avg_tT_loss:.6f} → {avg_tT_loss_weighted:.6f} ({tT_pct:.1f}%)")
+    print(f"      📝 Decoder NLL:       {avg_decoder_nll:.6f} → {avg_decoder_nll_weighted:.6f} ({decoder_pct:.1f}%)")
     
     # Compute embedding health metrics
     print(f"\n🔬 Computing embedding health metrics...")
@@ -452,15 +461,15 @@ def validate_model(model, val_loader, loss_fn, device, demo_example=None, tokeni
     # Log component analysis to wandb (corrected)
     import wandb
     wandb.log({
-        "val/loss_percentages/diffusion": diffusion_pct,
-        "val/loss_percentages/embedding": embedding_pct,
-        "val/loss_percentages/reconstruction": reconstruction_pct,
-        "val/loss/diffusion_raw": avg_diffusion_loss,
-        "val/loss/embedding_raw": avg_embedding_loss,
-        "val/loss/reconstruction_raw": avg_reconstruction_loss,
-        "val/loss/diffusion_weighted": avg_diffusion_loss_weighted,
-        "val/loss/embedding_weighted": avg_embedding_loss_weighted,
-        "val/loss/reconstruction_weighted": avg_reconstruction_loss_weighted,
+        "val/loss_percentages/mse": mse_pct,
+        "val/loss_percentages/tT_loss": tT_pct,
+        "val/loss_percentages/decoder_nll": decoder_pct,
+        "val/loss/mse_raw": avg_mse_loss,
+        "val/loss/tT_loss_raw": avg_tT_loss,
+        "val/loss/decoder_nll_raw": avg_decoder_nll,
+        "val/loss/mse_weighted": avg_mse_loss_weighted,
+        "val/loss/tT_loss_weighted": avg_tT_loss_weighted,
+        "val/loss/decoder_nll_weighted": avg_decoder_nll_weighted,
         "val/t0_samples_per_batch": avg_t0_samples,
         
         # Embedding health metrics
@@ -532,14 +541,14 @@ def train_denoiser(
     
     def diffusion_lm_loss(predicted_x0, target_x0, noisy_latents, input_ids, attention_mask, timesteps):
         """
-        Li et al. 2022 three-component loss function
+        Li et al. 2022 three-component loss function (corrected implementation)
         
         L_e2e_simple(w) = E_q[L_simple(x_0) + ||EMB(w) - μ_θ(x_1, 1)||² - log p_θ(w|x_0)]
         
         Components:
-        1. L_simple: Standard diffusion loss - MSE between predicted and target clean latents
-        2. Embedding loss: ||EMB(w) - μ_θ(x_1, 1)||² - prediction from least noisy state vs learnable embedding
-        3. Reconstruction loss: -log p_θ(w|x_0) - cross-entropy for rounding back to vocabulary
+        1. MSE loss: Standard diffusion loss with special t=0 handling
+        2. tT_loss: Prior matching loss at final timestep (signal fully corrupted)
+        3. Decoder NLL: Discrete token reconstruction loss
         
         Args:
             predicted_x0: Model predictions [B, L, C] - predicted clean latents
@@ -547,87 +556,126 @@ def train_denoiser(
             noisy_latents: Current noisy latents [B, L, C] (for metrics)
             input_ids: Original token IDs [B, L] for reconstruction loss
             attention_mask: Attention mask [B, L] for masking padded tokens
-            timesteps: Timestep indices [B] for embedding loss computation
+            timesteps: Timestep indices [B] for loss computation
         """
         batch_size = predicted_x0.shape[0]
         
-        # Flatten for computing similarities and magnitudes  
-        pred_flat_metrics = predicted_x0.reshape(batch_size, -1)
-        target_flat_metrics = target_x0.reshape(batch_size, -1)
-        noisy_flat_metrics = noisy_latents.reshape(batch_size, -1)
+        # Helper function for mean over non-batch dimensions
+        def mean_flat(tensor):
+            """Take mean over all non-batch dimensions."""
+            return tensor.view(batch_size, -1).mean(dim=1)
         
-        # COMPONENT 1: Standard diffusion loss
-        # Standard diffusion loss for all samples initially
+        # COMPONENT 1: MSE Loss with t=0 special handling
+        # Standard MSE loss for all timesteps
         standard_mse = F.mse_loss(predicted_x0, target_x0, reduction='none')  # [B, L, C]
         
-        # COMPONENT 2: Embedding alignment loss
-        # From Li et al. 2022: Only apply embedding alignment at t=0
+        # For t=0 samples, use embedding alignment instead
         t0_mask = (timesteps == 0)
-        # Get target embeddings for all samples (will be masked appropriately)
-        target_embeddings = model.embed_tokens(input_ids, attention_mask)
-        
-        # Compute embedding alignment loss for t=0 samples
-        t0_embedding_loss = F.mse_loss(
-            target_embeddings * attention_mask.unsqueeze(-1),
-            predicted_x0 * attention_mask.unsqueeze(-1),
-            reduction='none'
-        )
+        if t0_mask.any():
+            # Get target embeddings for t=0 samples
+            target_embeddings = model.embed_tokens(input_ids, attention_mask)
+            t0_embedding_loss = F.mse_loss(target_embeddings, predicted_x0, reduction='none')
             
-        # Use embedding alignment for t=0 samples, standard MSE for others
-        corrected_loss = torch.where(
-            t0_mask.unsqueeze(-1).unsqueeze(-1),
-            t0_embedding_loss,
-            standard_mse
-        )
+            # Replace MSE with embedding loss for t=0 samples
+            corrected_mse = torch.where(
+                t0_mask.unsqueeze(-1).unsqueeze(-1),
+                t0_embedding_loss,
+                standard_mse
+            )
+        else:
+            corrected_mse = standard_mse
         
-        # Track losses (embedding loss is zero when no t=0 samples)
-        diffusion_loss = corrected_loss.mean()
-        embedding_loss = t0_embedding_loss[t0_mask].mean() if t0_mask.any() else torch.tensor(0.0, device=predicted_x0.device)
+        # Apply attention mask and compute mean
+        attention_mask_3d = attention_mask.unsqueeze(-1).expand_as(corrected_mse)
+        masked_mse = corrected_mse * attention_mask_3d.float()
+        mse_loss = masked_mse.sum() / attention_mask_3d.sum()
         
-        # COMPONENT 3: Simplified discrete token reconstruction loss
-        reconstruction_loss, reconstruction_accuracy = token_discrete_loss(
+        # COMPONENT 2: tT_loss - Prior matching at final timestep
+        # This ensures the forward process fully corrupts signal to pure noise
+        final_timestep = torch.tensor([model.scheduler.num_timesteps - 1], device=target_x0.device)
+        
+        # Compute q_mean_variance at final timestep: out_mean = sqrt_alphas_cumprod[T-1] * x_start
+        sqrt_alphas_cumprod_final = torch.sqrt(model.scheduler.alphas_cumprod[final_timestep[0]])
+        out_mean = sqrt_alphas_cumprod_final * target_x0  # Signal remaining at final timestep
+        
+        # tT_loss = mean_flat(out_mean ** 2) - measures residual signal strength
+        tT_loss_per_sample = mean_flat(out_mean ** 2)
+        tT_loss = tT_loss_per_sample.mean()  # Average over batch
+        
+        # COMPONENT 3: Decoder NLL - Discrete token reconstruction loss
+        decoder_nll, reconstruction_accuracy = token_discrete_loss(
             predicted_x0, model, input_ids, attention_mask
         )
         
-        # Combine components
-        lambda_recon = 1.0  # Weight for reconstruction loss
-        total_loss = diffusion_loss + lambda_recon * reconstruction_loss
+        # Total loss: MSE + tT_loss + decoder_nll (matching reference implementation)
+        total_loss = mse_loss + tT_loss + decoder_nll
         
-        # Compute additional metrics for monitoring
-        pred_magnitudes = torch.norm(pred_flat_metrics, p=2, dim=1)
-        target_magnitudes = torch.norm(target_flat_metrics, p=2, dim=1)
+        # Compute additional metrics for monitoring (only over valid tokens)
+        # Apply attention mask to flatten only valid tokens
+        valid_mask = attention_mask.bool()
         
-        cosine_similarities = F.cosine_similarity(pred_flat_metrics, target_flat_metrics, dim=1)
-        magnitude_ratios = pred_magnitudes / (target_magnitudes + 1e-8)
+        # Get valid tokens only for more accurate metrics
+        pred_valid = predicted_x0[valid_mask]  # [num_valid_tokens, C]
+        target_valid = target_x0[valid_mask]   # [num_valid_tokens, C]
+        noisy_valid = noisy_latents[valid_mask] # [num_valid_tokens, C]
         
-        # Also compute denoising quality (how well we recover from noise)
-        denoising_similarity = F.cosine_similarity(pred_flat_metrics, target_flat_metrics, dim=1)
-        noise_similarity = F.cosine_similarity(noisy_flat_metrics, target_flat_metrics, dim=1)
-        denoising_improvement = denoising_similarity - noise_similarity
+        if pred_valid.numel() > 0:
+            # Compute magnitudes over valid tokens only
+            pred_magnitudes = torch.norm(pred_valid, p=2, dim=1)
+            target_magnitudes = torch.norm(target_valid, p=2, dim=1)
+            
+            # Compute similarities over valid tokens only
+            cosine_similarities = F.cosine_similarity(pred_valid, target_valid, dim=1)
+            magnitude_ratios = pred_magnitudes / (target_magnitudes + 1e-8)
+            
+            # Also compute denoising quality (how well we recover from noise)
+            denoising_similarity = F.cosine_similarity(pred_valid, target_valid, dim=1)
+            noise_similarity = F.cosine_similarity(noisy_valid, target_valid, dim=1)
+            denoising_improvement = denoising_similarity - noise_similarity
+            
+            # Average across valid tokens
+            cosine_sim_mean = cosine_similarities.mean()
+            magnitude_ratio_mean = magnitude_ratios.mean()
+            magnitude_ratio_std = magnitude_ratios.std()
+            cosine_sim_std = cosine_similarities.std()
+            denoising_improvement_mean = denoising_improvement.mean()
+            noise_similarity_mean = noise_similarity.mean()
+            pred_magnitude_mean = pred_magnitudes.mean()
+            target_magnitude_mean = target_magnitudes.mean()
+        else:
+            # Fallback if no valid tokens (shouldn't happen in practice)
+            cosine_sim_mean = torch.tensor(0.0, device=predicted_x0.device)
+            magnitude_ratio_mean = torch.tensor(1.0, device=predicted_x0.device)
+            magnitude_ratio_std = torch.tensor(0.0, device=predicted_x0.device)
+            cosine_sim_std = torch.tensor(0.0, device=predicted_x0.device)
+            denoising_improvement_mean = torch.tensor(0.0, device=predicted_x0.device)
+            noise_similarity_mean = torch.tensor(0.0, device=predicted_x0.device)
+            pred_magnitude_mean = torch.tensor(0.0, device=predicted_x0.device)
+            target_magnitude_mean = torch.tensor(0.0, device=predicted_x0.device)
         
         # Reconstruction accuracy is now computed in token_discrete_loss
         
         # Return loss and metrics for logging
         return {
             'total_loss': total_loss,
-            'diffusion_loss': diffusion_loss,  # Now includes embedding alignment for t=0
-            'embedding_loss': embedding_loss,  # For tracking t=0 alignment
-            'reconstruction_loss': reconstruction_loss,
-            'l2_loss': diffusion_loss,  # For backward compatibility
-            'l1_loss': F.l1_loss(predicted_x0, target_x0),
-            'cosine_sim': cosine_similarities.mean(),
-            'magnitude_ratio': magnitude_ratios.mean(),
-            'pred_magnitude_mean': pred_magnitudes.mean(),
-            'target_magnitude_mean': target_magnitudes.mean(),
-            'magnitude_ratio_std': magnitude_ratios.std(),
-            'cosine_sim_std': cosine_similarities.std(),
-            'denoising_improvement': denoising_improvement.mean(),
-            'noise_similarity': noise_similarity.mean(),
+            'mse_loss': mse_loss,  # Main diffusion loss component
+            'tT_loss': tT_loss,  # Prior matching loss at final timestep
+            'decoder_nll': decoder_nll,  # Discrete token reconstruction loss
+            'l2_loss': mse_loss,  # For backward compatibility
+            'l1_loss': F.l1_loss(predicted_x0 * attention_mask.unsqueeze(-1), target_x0 * attention_mask.unsqueeze(-1)),
+            'cosine_sim': cosine_sim_mean,
+            'magnitude_ratio': magnitude_ratio_mean,
+            'pred_magnitude_mean': pred_magnitude_mean,
+            'target_magnitude_mean': target_magnitude_mean,
+            'magnitude_ratio_std': magnitude_ratio_std,
+            'cosine_sim_std': cosine_sim_std,
+            'denoising_improvement': denoising_improvement_mean,
+            'noise_similarity': noise_similarity_mean,
             'reconstruction_accuracy': reconstruction_accuracy,
             # Individual loss component contributions for analysis
-            'diffusion_loss_weighted': diffusion_loss,
-            'embedding_loss_weighted': embedding_loss,
-            'reconstruction_loss_weighted': lambda_recon * reconstruction_loss,
+            'mse_loss_weighted': mse_loss,
+            'tT_loss_weighted': tT_loss,
+            'decoder_nll_weighted': decoder_nll,
             # t=0 tracking metrics
             't0_samples': t0_mask.sum().item(),
             'total_samples': batch_size,
@@ -734,9 +782,9 @@ def train_denoiser(
             # Log batch metrics less frequently for speed
             if batch_idx % 100 == 0:
                 # Calculate weighted component percentages for training batches
-                total_weighted_batch = (loss_dict['diffusion_loss_weighted'].item() + 
-                                      loss_dict['embedding_loss_weighted'].item() + 
-                                      loss_dict['reconstruction_loss_weighted'].item())
+                total_weighted_batch = (loss_dict['mse_loss_weighted'].item() + 
+                                      loss_dict['tT_loss_weighted'].item() + 
+                                      loss_dict['decoder_nll_weighted'].item())
 
                 wandb.log({
                     # Main training metrics
@@ -756,7 +804,9 @@ def train_denoiser(
                     
                     # t=0 tracking metrics (new)
                     "train/batch_t0_samples": loss_dict['t0_samples'],
-                    "train/batch_embedding_loss": loss_dict['embedding_loss'].item(),
+                    "train/batch_mse_loss": loss_dict['mse_loss'].item(),
+                    "train/batch_tT_loss": loss_dict['tT_loss'].item(),
+                    "train/batch_decoder_nll": loss_dict['decoder_nll'].item(),
                     
                     # Legacy individual metrics (for backward compatibility)
                     "train/batch_l2_loss": loss_dict['l2_loss'].item(),
